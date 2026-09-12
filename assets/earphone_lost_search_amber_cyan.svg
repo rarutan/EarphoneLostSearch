@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">EarphoneLostSearch</title>
+  <desc id="desc">A transparent vertical target ellipse pierced by a right-pointing timeline arrow.</desc>
+
+  <ellipse cx="112" cy="132" rx="64" ry="90" fill="none" stroke="#0F172A" stroke-width="30" stroke-opacity="0.18" />
+
+  <g fill="none" stroke="#22D3EE" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M22 128 H230" />
+    <path d="M190 84 L238 128 L190 172" />
+  </g>
+
+  <ellipse cx="108" cy="128" rx="64" ry="90" fill="none" stroke="#FBBF24" stroke-width="26" />
+
+  <g fill="none" stroke="#22D3EE" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M108 128 H230" />
+    <path d="M190 84 L238 128 L190 172" />
+  </g>
+</svg>

@@ -1,0 +1,5 @@
+[toolchain]
+# Use the stable toolchain for the current host OS.
+channel = "stable"
+profile = "minimal"
+components = ["rust-analyzer"]
