@@ -24,6 +24,7 @@ pub(crate) const FIELD_NPC_COUNT: &str = "1";
 pub(crate) const FIELD_TARGET_MODEL: &str = "0";
 pub(crate) const FIELD_ENCOUNTER_OFFSET: &str = "0";
 pub(crate) const FIELD_TOLERANCE: &str = "5";
+pub(crate) const FIELD_INITIAL_BRANCH_SCAN_SPAN: &str = "30";
 
 pub(crate) const DEFAULT_WAIT_FRAMES: &str = "0";
 pub(crate) const DEFAULT_FPS_TEXT: &str = "59.8621";

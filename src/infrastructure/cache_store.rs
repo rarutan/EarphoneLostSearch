@@ -21,7 +21,7 @@ pub(crate) struct CacheStore {
 impl Default for CacheStore {
     fn default() -> Self {
         Self {
-            directory: std::env::temp_dir().join("hatch-blink-search-cache"),
+            directory: std::env::temp_dir().join("earphone-lost-search-cache"),
         }
     }
 }

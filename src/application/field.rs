@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 use crate::domain::rng::generate_u64_values_from;
-use crate::domain::rng::{ModelStatus, ObservationCache, Sfmt, MAX_SFMT_FRAME};
+use crate::domain::rng::{ModelConsumption, ModelStatus, ObservationCache, Sfmt, MAX_SFMT_FRAME};
 use crate::domain::timing::{game_frames_to_seconds, seconds_to_game_frames};
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -58,6 +58,14 @@ const CANDIDATE_CONFIRM_SPAN: i64 = 1_000;
 /// 許容差が大きい場合も開始位置ごとの照合窓を分けて保持する。
 /// 同じ開始位置から同等の仮候補が無制限に増えないよう、候補数には上限を設ける。
 const MAX_MATCHING_WINDOWS_PER_START: usize = 64;
+/// 初期読み込み境界を探すために基準位置から走査する最小幅。
+/// NPC番号やモデル数とは独立した値で、特殊消費の候補開始位置だけを拾う。
+/// 初期分岐探索幅の既定値。設定画面から変更できる。
+pub const DEFAULT_INITIAL_BRANCH_SCAN_SPAN: i64 = 30;
+#[cfg(test)]
+pub const INITIAL_BRANCH_SCAN_SPAN: i64 = DEFAULT_INITIAL_BRANCH_SCAN_SPAN;
+/// 初期分岐探索幅として許可する上限。
+pub const MAX_INITIAL_BRANCH_SCAN_SPAN: i64 = 1_000;
 const SEARCH_CANCELLED: &str = "検索をキャンセルしました。";
 
 // ---------------------------------------------------------------------------
@@ -101,6 +109,9 @@ pub struct FieldResult {
     pub first_consumption: i64,
     pub last_consumption: i64,
     pub intervals: Vec<i64>,
+    /// 観測対象モデルが各瞬きで実際に参照したSFMT絶対位置。
+    /// 全モデル処理後の合計カーソルとは異なり、候補Timelineの合流判定に使う。
+    pub target_consumptions: Vec<i64>,
     /// 最後に観測した瞬きから、次に同じモデルが瞬きするまでの表示Frame。
     pub next_blink_wait_frame: i64,
     /// Target消費数を指定した場合の、最後の観測瞬きからの表示Frame。
@@ -136,6 +147,8 @@ pub struct FieldTimelineRow {
     pub duration_frames: i64,
     /// 実測観測ですでに通過した瞬き行。
     pub observed: bool,
+    /// この行の瞬きで観測対象モデルが参照したSFMT位置。
+    pub target_consumption: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,11 +159,10 @@ struct TimelineCursor {
     tick: i64,
 }
 
-/// 瞬きを観測したモデル番号が分かっているかどうか。
+/// フィールド検索のNPC番号指定モード。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldTargetMode {
     Known,
-    Unknown,
 }
 
 /// 実際に取得できたFrameから逆算した、観測対象idxの候補。
@@ -176,6 +188,7 @@ struct BlinkEvent {
     consumption: i64,
     status: ModelStatus,
     stream_cursor: i64,
+    model_consumption: Option<i64>,
 }
 
 /// 検索開始消費数を基準に保持するSFMT列。
@@ -269,6 +282,24 @@ fn next_state_with_values(
         };
         *stream_cursor += 1;
         value
+    });
+    (!exhausted).then_some(result)
+}
+
+fn next_state_with_positions_values(
+    status: &mut ModelStatus,
+    stream_cursor: &mut i64,
+    values: &SearchValues,
+) -> Option<(usize, Vec<ModelConsumption>)> {
+    let mut exhausted = false;
+    let result = status.next_state_with_positions(|| {
+        let position = *stream_cursor;
+        let Some(value) = values.get(position) else {
+            exhausted = true;
+            return (position, 0);
+        };
+        *stream_cursor += 1;
+        (position, value)
     });
     (!exhausted).then_some(result)
 }
@@ -571,7 +602,24 @@ pub(crate) fn search_with_npc_range_with_pool(
 pub(crate) fn search_with_npc_range_with_pool_cancelable(
     configs: &[FieldConfig],
     pool: &FieldSearchPool,
-    target_mode: FieldTargetMode,
+    _target_mode: FieldTargetMode,
+    cancel: Option<&AtomicBool>,
+) -> Result<FieldSearchOutcome, String> {
+    search_with_npc_range_with_pool_cancelable_and_span(
+        configs,
+        pool,
+        _target_mode,
+        DEFAULT_INITIAL_BRANCH_SCAN_SPAN,
+        cancel,
+    )
+}
+
+/// 初期分岐探索幅を指定して複数NPC検索を実行する。
+pub(crate) fn search_with_npc_range_with_pool_cancelable_and_span(
+    configs: &[FieldConfig],
+    pool: &FieldSearchPool,
+    _target_mode: FieldTargetMode,
+    initial_branch_scan_span: i64,
     cancel: Option<&AtomicBool>,
 ) -> Result<FieldSearchOutcome, String> {
     check_cancelled(cancel)?;
@@ -582,16 +630,18 @@ pub(crate) fn search_with_npc_range_with_pool_cancelable(
         .par_iter()
         .map(|config| {
             check_cancelled(cancel)?;
-            match target_mode {
-                FieldTargetMode::Known => Ok(FieldSearchOutcome {
-                    results: search_v12_with_cache_cancelable(config, &pool.cache, false, cancel)?,
-                    fallback_indices: None,
-                }),
-                FieldTargetMode::Unknown => Ok(FieldSearchOutcome {
-                    results: search_v12_with_cache_cancelable(config, &pool.cache, true, cancel)?,
-                    fallback_indices: None,
-                }),
-            }
+            // NPC番号は検索開始時に固定せず、同じTimelineから全モデルを照合する。
+            // 入力された番号の妥当性は候補確定後にUI側で判定する。
+            Ok(FieldSearchOutcome {
+                results: search_v12_with_cache_cancelable_with_span(
+                    config,
+                    &pool.cache,
+                    true,
+                    initial_branch_scan_span,
+                    cancel,
+                )?,
+                fallback_indices: None,
+            })
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mut results = Vec::new();
@@ -616,6 +666,7 @@ pub(crate) fn search_with_npc_range_with_pool_cancelable(
             result.last_wait_frame,
         )
     });
+    results = merge_observable_candidates(results);
     fallback_indices.sort_unstable();
     fallback_indices.dedup();
     Ok(FieldSearchOutcome {
@@ -624,28 +675,68 @@ pub(crate) fn search_with_npc_range_with_pool_cancelable(
     })
 }
 
+/// 完全に同じ候補だけを検索段階で重複排除する。
+///
+/// 観測中に`remain`とSFMTカーソルが合流した候補は、過去の列が異なっていても
+/// 後段の`FieldState::normalize_search_results`で現在状態をキーに統合する。
+/// ここでは候補を早期に捨てず、NPC番号による代表選択に必要な履歴を保持する。
+fn merge_observable_candidates(mut results: Vec<FieldResult>) -> Vec<FieldResult> {
+    results.sort_by_key(|result| {
+        (
+            result.start_consumption,
+            result.observed_model,
+            result.first_wait_frame,
+            result.last_wait_frame,
+        )
+    });
+    let mut representatives: Vec<FieldResult> = Vec::with_capacity(results.len());
+    for result in results {
+        if representatives.iter().any(|representative| {
+            representative.start_consumption == result.start_consumption
+                && representative.models == result.models
+                && representative.observed_model == result.observed_model
+                && representative.first_wait_frame == result.first_wait_frame
+                && representative.last_wait_frame == result.last_wait_frame
+                && representative.intervals == result.intervals
+                && representative.target_consumptions == result.target_consumptions
+        }) {
+            continue;
+        }
+        representatives.push(result);
+    }
+    representatives
+}
+
 /// タイムライン仕様互換の通常検索。
 ///
 /// `range_start`は基準となるSFMT消費数、`range_end - range_start`は
 /// その位置からTimelineを走査するtick数として扱う。参照実装が試す開始位置は
 /// 基準消費数から総モデル数個だけで、GUIの範囲全体を開始候補にはしない。
-fn search_v12_with_cache_cancelable(
+fn search_v12_with_cache_cancelable_with_span(
     config: &FieldConfig,
     cache: &ObservationCache,
     all_models: bool,
+    initial_branch_scan_span: i64,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<FieldResult>, String> {
     validate_static_config(config)?;
     check_cancelled(cancel)?;
     let raw_config = reference_tick_config(config);
     let base = config.range_start;
-    let max_start = base.saturating_add(config.models.saturating_sub(1) as i64);
     let interval_end = reference_search_stream_end(&raw_config);
     let interval_count = interval_end.saturating_sub(base).saturating_add(1).max(0) as usize;
     let interval_values = SearchValues::new(base, cache.read_values(base, interval_count)?);
-    // 開始位置ごとの間隔照合は独立しているため並列化する。結果を開始位置順に
-    // 並べ直してから、最も早い候補を選択する。
-    let mut results = (base..=max_start)
+    // 初期読み込みの境界候補だけを開始位置として展開する。NPC番号を開始位置へ
+    // 加算せず、同じTimelineから全モデルの瞬き列を照合する。
+    let candidate_starts = candidate_start_positions_with_span(
+        base,
+        config.range_end,
+        initial_branch_scan_span,
+        &interval_values,
+    );
+    // 候補開始位置ごとの間隔照合は独立しているため並列化する。結果を開始位置順に
+    // 並べ直してから、同じ開始位置・同じモデル数の代表候補をUI側で選択する。
+    let mut results = candidate_starts
         .into_par_iter()
         .flat_map_iter(|start_consumption| {
             search_v12_start_all_models(
@@ -670,6 +761,12 @@ fn search_v12_with_cache_cancelable(
         )
     });
 
+    // 観測列に一致したモデル番号が入力番号と異なる場合は、入力番号へ
+    // 開始位置を正規化してから同じ条件でTimelineを再生成する。元候補より
+    // 前へ戻る変換は、別の初期読み込みや-5分岐を含むため候補にしない。
+    results =
+        resolve_observed_model_candidates(results, config, &raw_config, &interval_values, cancel);
+
     let Some(target) = config.target_consumption else {
         results.sort_by_key(|result| {
             (
@@ -681,13 +778,10 @@ fn search_v12_with_cache_cancelable(
         });
         return Ok(results);
     };
-    // 観測対象idxが不明な間は、Target到達判定を特定のidxへ誤適用しない。
-    if all_models {
-        return Ok(results);
-    }
-
     // Target到達判定は保存済みの連続状態から行い、巨大なSFMT後続列を読み込まない。
     // 候補ごとに独立しているため並列化し、最後に開始位置順へ戻す。
+    // 全モデル照合時も各モデルの結果へ個別に適用する。UIは候補確定後に
+    // 入力NPC番号へ一致する行を選び、未一致なら代表行を仮表示する。
     let mut targeted = results
         .into_par_iter()
         .map(|result| apply_target_from_cursor(result, config.seed, target, cancel))
@@ -703,6 +797,125 @@ fn search_v12_with_cache_cancelable(
     Ok(targeted)
 }
 
+/// 観測列に一致したモデル番号を、入力されたモデル番号へ変換して再検証する。
+///
+/// 変換後の開始位置が元候補より前になる場合は、候補を破棄せず元の候補を
+/// NPC番号不一致のフォールバックとして残す。変換後Timelineが観測したSFMT
+/// 位置列まで一致した場合だけ、再生成結果を採用する。
+fn resolve_observed_model_candidates(
+    results: Vec<FieldResult>,
+    display_config: &FieldConfig,
+    raw_config: &FieldConfig,
+    values: &SearchValues,
+    cancel: Option<&AtomicBool>,
+) -> Vec<FieldResult> {
+    let requested_model = display_config.target_model;
+    let mut resolved = Vec::with_capacity(results.len());
+    let mut fallbacks = Vec::new();
+    for result in results {
+        if result.observed_model == requested_model {
+            resolved.push(result);
+            continue;
+        }
+
+        let Some(shifted_start) = shifted_start_for_requested_model(
+            result.start_consumption,
+            result.observed_model,
+            requested_model,
+        ) else {
+            fallbacks.push(result);
+            continue;
+        };
+        if shifted_start < display_config.range_start || shifted_start > display_config.range_end {
+            fallbacks.push(result);
+            continue;
+        }
+
+        let regenerated = search_v12_start_all_models(
+            shifted_start,
+            raw_config,
+            display_config,
+            values,
+            true,
+            true,
+            cancel,
+        );
+        let matching = regenerated.into_iter().filter(|candidate| {
+            candidate.observed_model == requested_model
+                && candidate.intervals == result.intervals
+                && candidate.target_consumptions == result.target_consumptions
+        });
+        let mut accepted = false;
+        for candidate in matching {
+            accepted = true;
+            resolved.push(candidate);
+        }
+        if !accepted {
+            // 入力番号へ変換できない候補は、他に有効候補がある場合は破棄する。
+            // 全候補が不一致だった場合だけ、後段でNPC番号×を表示する代表として残す。
+            fallbacks.push(result);
+        }
+    }
+    if resolved.is_empty() {
+        // 1〜6段階では、NPC番号不一致時の代表選択をまだ行わない。
+        // 元候補を残して`NPC番号×`または複数候補としてUIへ返す。
+        resolved = fallbacks;
+    }
+    merge_observable_candidates(resolved)
+}
+
+/// 観測済みモデルを入力モデルへ変換した開始位置を返す。
+///
+/// 元候補の開始位置より前へ戻る変換は、候補の因果関係を壊して`-5`を含む
+/// 別の初期状態を混ぜるため、候補として扱わない。
+fn shifted_start_for_requested_model(
+    start_consumption: i64,
+    observed_model: usize,
+    requested_model: usize,
+) -> Option<i64> {
+    let shifted = start_consumption.checked_add(observed_model as i64 - requested_model as i64)?;
+    (shifted >= start_consumption).then_some(shifted)
+}
+
+/// 初期読み込み境界を表す候補開始位置を生成する。
+///
+/// `base`そのものは常に候補に含め、基準位置から探索幅内で特殊値を見つけた
+/// 場合だけ、そのSFMT位置の直後を別のTimeline開始位置として追加する。
+/// NPC番号やモデル数は開始位置へ加算しない。
+#[cfg(test)]
+fn candidate_start_positions(base: i64, range_end: i64, values: &SearchValues) -> Vec<i64> {
+    candidate_start_positions_with_span(base, range_end, DEFAULT_INITIAL_BRANCH_SCAN_SPAN, values)
+}
+
+fn candidate_start_positions_with_span(
+    base: i64,
+    range_end: i64,
+    scan_span: i64,
+    values: &SearchValues,
+) -> Vec<i64> {
+    let scan_end = base
+        .saturating_add(scan_span.max(0))
+        .min(range_end)
+        .min(MAX_SFMT_FRAME);
+    let mut starts = vec![base];
+    if scan_end >= base {
+        for position in base..=scan_end {
+            let Some(value) = values.get(position) else {
+                continue;
+            };
+            if value & 0x7f == 0 {
+                let candidate = position.saturating_add(1);
+                if candidate <= range_end && candidate <= MAX_SFMT_FRAME {
+                    starts.push(candidate);
+                }
+            }
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+}
+
 /// 表示Frameで保持している観測値を、参照実装の1/30秒tickへ変換する。
 fn reference_tick_config(config: &FieldConfig) -> FieldConfig {
     let mut converted = config.clone();
@@ -711,7 +924,9 @@ fn reference_tick_config(config: &FieldConfig) -> FieldConfig {
         .iter()
         .map(|frame| ((*frame as f64) / 2.0).round() as i64)
         .collect();
-    converted.tolerance = 10;
+    // GUIの許容差は表示Frame単位なので、参照Timelineのtick単位へ変換する。
+    // 奇数Frameは切り上げ、入力した許容範囲を狭めないようにする。
+    converted.tolerance = (config.tolerance.saturating_add(1)) / 2;
     converted
 }
 
@@ -749,13 +964,14 @@ fn search_v12_start_all_models(
         if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
             return Vec::new();
         }
-        let Some((used, blink)) = next_state_with_values(&mut status, &mut stream_cursor, values)
+        let Some((used, consumed)) =
+            next_state_with_positions_values(&mut status, &mut stream_cursor, values)
         else {
             break;
         };
         let _ = used;
-        for model in blink {
-            if let Some(events) = events_by_model.get_mut(model as usize) {
+        for event in consumed.into_iter().filter(|event| event.blink) {
+            if let Some(events) = events_by_model.get_mut(event.model) {
                 events.push(BlinkEvent {
                     // 照合中は外部仕様と同じ1/30秒tickを保持する。表示Frame（tick×2）へ
                     // の変換は照合窓が一致した後に行う。
@@ -763,6 +979,7 @@ fn search_v12_start_all_models(
                     consumption: stream_cursor,
                     status: status.clone(),
                     stream_cursor,
+                    model_consumption: Some(event.position),
                 });
             }
         }
@@ -793,6 +1010,7 @@ fn search_v12_start_all_models(
                     consumption: event.consumption,
                     status: event.status.clone(),
                     stream_cursor: event.stream_cursor,
+                    model_consumption: event.model_consumption,
                 })
                 .collect::<Vec<_>>();
             if let Some(result) = result_from_window(
@@ -1249,6 +1467,7 @@ fn search_start_all_models_cancelable(
                 consumption,
                 status: status.clone(),
                 stream_cursor,
+                model_consumption: None,
             });
         }
     }
@@ -1622,6 +1841,7 @@ fn search_candidate_all_with_mode_cancelable(
                 consumption,
                 status: status.clone(),
                 stream_cursor,
+                model_consumption: None,
             });
         }
 
@@ -1711,6 +1931,7 @@ fn result_from_window(
                 timeline_frame: event.wait_frame,
                 duration_frames: 0,
                 observed: true,
+                target_consumption: event.model_consumption,
             })
             .collect::<Vec<_>>();
         let cursor = TimelineCursor {
@@ -1741,6 +1962,10 @@ fn result_from_window(
         intervals: window
             .windows(2)
             .map(|pair| pair[1].wait_frame - pair[0].wait_frame)
+            .collect(),
+        target_consumptions: window
+            .iter()
+            .map(|event| event.model_consumption.unwrap_or(event.consumption))
             .collect(),
         next_blink_wait_frame,
         target_wait_frame,
@@ -1775,41 +2000,55 @@ fn build_timeline(
         .map(|_| usize::MAX)
         .unwrap_or(MAX_CANDIDATE_TIMELINE_EVENTS);
     while tick < MAX_WAIT_TICKS && next_events.len() < event_limit {
-        let Some((used, blink)) = next_state_with_values(&mut status, &mut stream_cursor, values)
+        let Some((used, consumed)) =
+            next_state_with_positions_values(&mut status, &mut stream_cursor, values)
         else {
             break;
         };
         consumption += used as i64;
         tick += 1;
-        if blink.contains(&(target_model as u8)) {
+        if let Some(target_event) = consumed
+            .into_iter()
+            .find(|event| event.model == target_model && event.blink)
+        {
             let wait_frame = tick * 2;
-            next_events.push((wait_frame, consumption));
+            next_events.push((wait_frame, consumption, target_event.position));
             if target_absolute_wait_frame.is_some_and(|target| wait_frame >= target) {
                 break;
             }
         }
     }
 
-    let mut all_events: Vec<(i64, i64, bool)> = observed_events
+    let mut all_events: Vec<(i64, i64, bool, Option<i64>)> = observed_events
         .iter()
-        .map(|event| (event.wait_frame, event.consumption, true))
+        .map(|event| {
+            (
+                event.wait_frame,
+                event.consumption,
+                true,
+                event.model_consumption,
+            )
+        })
         .collect();
-    all_events.extend(
-        next_events
-            .into_iter()
-            .map(|(wait_frame, consumption)| (wait_frame, consumption, false)),
-    );
+    all_events.extend(next_events.into_iter().map(
+        |(wait_frame, consumption, target_consumption)| {
+            (wait_frame, consumption, false, Some(target_consumption))
+        },
+    ));
     let mut rows = Vec::with_capacity(all_events.len());
-    for (index, (wait_frame, consumption, observed)) in all_events.iter().copied().enumerate() {
+    for (index, (wait_frame, consumption, observed, target_consumption)) in
+        all_events.iter().copied().enumerate()
+    {
         let duration_frames = all_events
             .get(index + 1)
-            .map(|(next_wait, _, _)| *next_wait - wait_frame)
+            .map(|(next_wait, _, _, _)| *next_wait - wait_frame)
             .unwrap_or_default();
         rows.push(FieldTimelineRow {
             frame: consumption,
             timeline_frame: wait_frame,
             duration_frames,
             observed,
+            target_consumption,
         });
     }
     (
@@ -2193,6 +2432,7 @@ mod tests {
             first_consumption: 0,
             last_consumption: 0,
             intervals: Vec::new(),
+            target_consumptions: Vec::new(),
             next_blink_wait_frame: 0,
             target_wait_frame: None,
             target_exact: None,
@@ -2208,5 +2448,1264 @@ mod tests {
         let corrected =
             suggest_field_offset_from_result_cancelable(0, &result, 6, 12, 4, None).unwrap();
         assert_eq!(corrected, Some(2));
+    }
+
+    #[test]
+    fn candidate_starts_include_only_special_boundaries_near_the_base() {
+        let mut values = vec![1_u64; 64];
+        values[5] = 128;
+        values[10] = 256;
+        values[40] = 384;
+        let search_values = SearchValues::new(100, values);
+
+        assert_eq!(
+            candidate_start_positions(100, 200, &search_values),
+            vec![100, 106, 111]
+        );
+    }
+
+    #[test]
+    fn configured_initial_branch_scan_span_controls_special_boundaries() {
+        let mut values = vec![1_u64; 64];
+        values[40] = 128;
+        let search_values = SearchValues::new(100, values);
+
+        assert_eq!(
+            candidate_start_positions_with_span(100, 200, 10, &search_values),
+            vec![100]
+        );
+        assert_eq!(
+            candidate_start_positions_with_span(100, 200, 40, &search_values),
+            vec![100, 141]
+        );
+    }
+
+    #[test]
+    fn reference_tick_config_uses_gui_tolerance_in_display_frames() {
+        let mut config = FieldConfig {
+            seed: 1,
+            range_start: 0,
+            range_end: 100,
+            models: 2,
+            target_model: 0,
+            observed_intervals: vec![15, 20],
+            tolerance: 5,
+            target_consumption: None,
+        };
+        assert_eq!(reference_tick_config(&config).tolerance, 3);
+
+        config.tolerance = 20;
+        assert_eq!(reference_tick_config(&config).tolerance, 10);
+    }
+
+    #[test]
+    fn npc_model_conversion_only_moves_forward_from_candidate_start() {
+        assert_eq!(shifted_start_for_requested_model(480, 2, 0), Some(482));
+        assert_eq!(shifted_start_for_requested_model(480, 9, 6), Some(483));
+        assert_eq!(shifted_start_for_requested_model(485, 4, 6), None);
+        assert_eq!(shifted_start_for_requested_model(485, 7, 9), None);
+    }
+
+    #[test]
+    fn npc_model_conversion_rebuilds_a_matching_timeline() {
+        let base = 480_i64;
+        let models = 13_usize;
+        let mut converted = None;
+
+        for seed in 0_u32..500 {
+            let traces = generated_target_streams(seed, base, models, 240);
+            let (positions, waits) = &traces[2];
+            if positions.len() < 4 {
+                continue;
+            }
+            let positions = positions[..4].to_vec();
+            let intervals = waits[..4]
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .collect::<Vec<_>>();
+            let config = FieldConfig {
+                seed,
+                range_start: base,
+                range_end: base + 240,
+                models,
+                target_model: 0,
+                observed_intervals: intervals.clone(),
+                tolerance: 0,
+                target_consumption: None,
+            };
+            let raw_config = reference_tick_config(&config);
+            let stream_end = reference_search_stream_end(&raw_config);
+            let values = SearchValues::new(
+                base,
+                generate_u64_values_from(
+                    seed,
+                    base as usize,
+                    stream_end.saturating_sub(base).saturating_add(1) as usize,
+                ),
+            );
+            let raw =
+                search_v12_start_all_models(base, &raw_config, &config, &values, true, true, None);
+            if !raw.iter().any(|result| {
+                result.observed_model == 2
+                    && result.intervals == intervals
+                    && result.target_consumptions == positions
+            }) {
+                continue;
+            }
+            let resolved =
+                resolve_observed_model_candidates(raw, &config, &raw_config, &values, None);
+            if resolved.iter().any(|result| {
+                result.start_consumption == base + 2
+                    && result.observed_model == 0
+                    && result.intervals == intervals
+                    && result.target_consumptions == positions
+            }) {
+                converted = Some(seed);
+                break;
+            }
+        }
+
+        assert!(
+            converted.is_some(),
+            "NPC番号変換後に再生成したTimelineが観測列へ一致しませんでした"
+        );
+        println!("NPC番号変換の実Timeline検証Seed: {:?}", converted);
+    }
+
+    #[test]
+    #[ignore = "1〜6段階後に複数候補が残る実データを探す診断"]
+    fn diagnostic_unresolved_candidates_after_model_resolution() {
+        let base = 480_i64;
+        let mut checked = 0_usize;
+        let mut unresolved = Vec::new();
+
+        'seeds: for seed in 0_u32..500 {
+            for &models in &[5_usize, 10, 13, 20, 22] {
+                let stream_len = models.saturating_mul(280).saturating_add(128);
+                let all_values = generate_u64_values_from(seed, base as usize, stream_len);
+                let starts = candidate_start_positions(
+                    base,
+                    base + 240,
+                    &SearchValues::new(base, all_values[..31].to_vec()),
+                );
+                if starts.len() < 2 {
+                    continue;
+                }
+                let raw_config = FieldConfig {
+                    seed,
+                    range_start: base,
+                    range_end: base + 240,
+                    models,
+                    target_model: 0,
+                    observed_intervals: Vec::new(),
+                    tolerance: 0,
+                    target_consumption: None,
+                };
+                let stream_end = reference_search_stream_end(&raw_config);
+                let values = SearchValues::new(
+                    base,
+                    generate_u64_values_from(
+                        seed,
+                        base as usize,
+                        stream_end.saturating_sub(base).saturating_add(1) as usize,
+                    ),
+                );
+                for target_model in 0..models {
+                    for &source_start in &starts {
+                        let trace = generated_target_trace_with_state(
+                            seed,
+                            source_start,
+                            models,
+                            target_model,
+                            240,
+                        );
+                        if trace.len() < 4 {
+                            continue;
+                        }
+                        let intervals = trace[..4]
+                            .windows(2)
+                            .map(|pair| pair[1].1 - pair[0].1)
+                            .collect::<Vec<_>>();
+                        let mut config = raw_config.clone();
+                        config.target_model = target_model;
+                        config.observed_intervals = intervals.clone();
+                        let converted_config = reference_tick_config(&config);
+                        let mut raw_results = Vec::new();
+                        for &start in &starts {
+                            raw_results.extend(search_v12_start_all_models(
+                                start,
+                                &converted_config,
+                                &config,
+                                &values,
+                                true,
+                                true,
+                                None,
+                            ));
+                        }
+                        let resolved = resolve_observed_model_candidates(
+                            raw_results,
+                            &config,
+                            &converted_config,
+                            &values,
+                            None,
+                        );
+                        let mut keys = resolved
+                            .into_iter()
+                            .filter(|result| result.observed_model == target_model)
+                            .map(|result| {
+                                (
+                                    result.start_consumption,
+                                    result.observed_model,
+                                    result.target_consumptions,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        keys.sort_by_key(|key| key.0);
+                        keys.dedup();
+                        checked += 1;
+                        if keys.len() > 1 {
+                            unresolved.push((
+                                seed,
+                                models,
+                                target_model,
+                                source_start,
+                                starts.clone(),
+                                keys,
+                            ));
+                            if unresolved.len() >= 5 {
+                                break 'seeds;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        println!("1〜6段階後の未解決候補: checked={checked}, examples={unresolved:#?}");
+        assert!(checked > 0);
+    }
+
+    #[test]
+    #[ignore = "Seed 00000067の分岐候補周辺を比較する診断"]
+    fn diagnostic_seed_00000067_compare_branch_neighbors() {
+        let seed = 103_u32;
+        let models = 5_usize;
+        let target_model = 4_usize;
+        let base = 480_i64;
+        let values = generate_u64_values_from(seed, base as usize, 40);
+        let special = values
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| **value & 0x7f == 0)
+            .map(|(index, value)| (base + index as i64, *value))
+            .collect::<Vec<_>>();
+        println!("seed=00000067 special SFMT positions={special:#?}");
+        for start in [480_i64, 486_i64] {
+            let trace = generated_target_trace_with_state(seed, start, models, target_model, 600);
+            println!(
+                "seed=00000067 start={start} first_events={:#?}",
+                trace.iter().take(8).collect::<Vec<_>>()
+            );
+        }
+        let left = generated_target_trace_with_state(seed, 480, models, target_model, 100_000);
+        let right = generated_target_trace_with_state(seed, 486, models, target_model, 100_000);
+        let first_difference = left
+            .iter()
+            .zip(right.iter())
+            .position(|(left, right)| left.0 != right.0 || left.1 != right.1);
+        println!(
+            "seed=00000067 target4 future: left_events={} right_events={} first_difference={first_difference:?}",
+            left.len(),
+            right.len()
+        );
+        let left_positions = left.iter().map(|event| event.0).collect::<Vec<_>>();
+        let right_positions = right.iter().map(|event| event.0).collect::<Vec<_>>();
+        let first_position_difference_after_two = left_positions
+            .iter()
+            .skip(2)
+            .zip(right_positions.iter().skip(2))
+            .position(|(left, right)| left != right);
+        println!(
+            "seed=00000067 target4 position difference after first 2: {first_position_difference_after_two:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "正規化後も複数の内部状態候補が残る反例を走査する診断"]
+    fn diagnostic_counterexamples_after_full_state_merge() {
+        let base = 480_i64;
+        let mut checked = 0_usize;
+        let mut unresolved = Vec::new();
+
+        'seeds: for seed in 0_u32..500 {
+            for &models in &[5_usize, 10, 13, 20, 22] {
+                let values = generate_u64_values_from(
+                    seed,
+                    base as usize,
+                    (INITIAL_BRANCH_SCAN_SPAN + 1) as usize,
+                );
+                let starts =
+                    candidate_start_positions(base, base + 240, &SearchValues::new(base, values));
+                if starts.len() < 2 {
+                    continue;
+                }
+                let raw_config = FieldConfig {
+                    seed,
+                    range_start: base,
+                    range_end: base + 240,
+                    models,
+                    target_model: 0,
+                    observed_intervals: Vec::new(),
+                    tolerance: 0,
+                    target_consumption: None,
+                };
+                let stream_end = reference_search_stream_end(&raw_config);
+                let search_values = SearchValues::new(
+                    base,
+                    generate_u64_values_from(
+                        seed,
+                        base as usize,
+                        stream_end.saturating_sub(base).saturating_add(1) as usize,
+                    ),
+                );
+
+                for target_model in 0..models {
+                    for &source_start in &starts {
+                        let trace = generated_target_trace_with_state(
+                            seed,
+                            source_start,
+                            models,
+                            target_model,
+                            240,
+                        );
+                        if trace.len() < 4 {
+                            continue;
+                        }
+                        let intervals = trace[..4]
+                            .windows(2)
+                            .map(|pair| pair[1].1 - pair[0].1)
+                            .collect::<Vec<_>>();
+                        let mut config = raw_config.clone();
+                        config.target_model = target_model;
+                        config.observed_intervals = intervals;
+                        let converted_config = reference_tick_config(&config);
+                        let mut raw_results = Vec::new();
+                        for &start in &starts {
+                            raw_results.extend(search_v12_start_all_models(
+                                start,
+                                &converted_config,
+                                &config,
+                                &search_values,
+                                true,
+                                true,
+                                None,
+                            ));
+                        }
+                        let resolved = resolve_observed_model_candidates(
+                            raw_results,
+                            &config,
+                            &converted_config,
+                            &search_values,
+                            None,
+                        );
+                        let mut state = FieldState::default();
+                        state.target_model = target_model.to_string();
+                        let normalized = state.normalize_search_results(resolved);
+                        checked += 1;
+                        if normalized.len() > 1 {
+                            if seed == 103 && models == 5 && target_model == 4 {
+                                for result in &normalized {
+                                    println!(
+                                        "seed=00000067 normalized start={} cursor={:?}",
+                                        result.start_consumption,
+                                        result
+                                            .target_cursor
+                                            .as_ref()
+                                            .or(result.timeline_cursor.as_ref())
+                                            .map(|cursor| {
+                                                (
+                                                    cursor.stream_cursor,
+                                                    cursor.consumption,
+                                                    cursor.tick,
+                                                    cursor.status.remain.clone(),
+                                                )
+                                            })
+                                    );
+                                }
+                            }
+                            unresolved.push((
+                                seed,
+                                models,
+                                target_model,
+                                source_start,
+                                normalized
+                                    .iter()
+                                    .map(|result| {
+                                        let cursor = result
+                                            .target_cursor
+                                            .as_ref()
+                                            .or(result.timeline_cursor.as_ref())
+                                            .map(|cursor| {
+                                                (
+                                                    cursor.stream_cursor,
+                                                    cursor.consumption,
+                                                    cursor.tick,
+                                                    cursor.status.remain.clone(),
+                                                )
+                                            });
+                                        (
+                                            result.start_consumption,
+                                            result.observed_model,
+                                            result.target_consumptions.clone(),
+                                            cursor,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ));
+                            if unresolved.len() >= 10 {
+                                break 'seeds;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        println!("正規化後の未解決候補: checked={checked}, examples={unresolved:#?}");
+        assert!(checked > 0);
+    }
+
+    #[test]
+    #[ignore = "同一Start480の別観測窓を追加瞬きで区別できるかの診断"]
+    fn diagnostic_seed_0000019f_same_start_windows_future_disambiguation() {
+        let seed = 415_u32;
+        let models = 22_usize;
+        let target_model = 4_usize;
+        let trace = generated_target_trace_with_state(seed, 480, models, target_model, 20_000);
+        let windows = [[688_i64, 1430, 2269, 3098], [1430_i64, 2269, 3098, 3947]]
+            .into_iter()
+            .map(|positions| {
+                trace
+                    .windows(4)
+                    .find(|window| window.iter().map(|event| event.0).eq(positions.into_iter()))
+                    .map(|window| window.to_vec())
+                    .expect("diagnostic observation window exists")
+            })
+            .collect::<Vec<_>>();
+
+        let futures = windows
+            .iter()
+            .map(|window| continue_target_trace(seed, window.last().unwrap(), target_model, 2_000))
+            .collect::<Vec<_>>();
+        let first_difference = futures[0]
+            .iter()
+            .zip(futures[1].iter())
+            .position(|(left, right)| left != right);
+        println!(
+            "seed=0000019F same-start windows={:?}",
+            windows
+                .iter()
+                .map(|window| {
+                    (
+                        window.iter().map(|event| event.0).collect::<Vec<_>>(),
+                        window.iter().map(|event| event.1).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "seed=0000019F future first_difference={first_difference:?} left_len={} right_len={} left_head={:?} right_head={:?}",
+            futures[0].len(),
+            futures[1].len(),
+            futures[0].iter().take(8).collect::<Vec<_>>(),
+            futures[1].iter().take(8).collect::<Vec<_>>(),
+        );
+        assert!(first_difference.is_some());
+    }
+
+    #[test]
+    #[ignore = "正規化後に残る3系列を追加瞬きで区別できるかの診断"]
+    fn diagnostic_remaining_counterexamples_future_disambiguation() {
+        let cases = [
+            (
+                104_u32,
+                10_usize,
+                0_usize,
+                [480_i64, 517_i64],
+                [647_i64, 1434, 1751, 2238],
+                [649_i64, 1434, 1751, 2238],
+            ),
+            (
+                269_u32,
+                20_usize,
+                9_usize,
+                [482_i64, 501_i64],
+                [937_i64, 1741, 2607, 3635],
+                [984_i64, 1741, 2607, 3635],
+            ),
+            (
+                415_u32,
+                13_usize,
+                0_usize,
+                [483_i64, 508_i64],
+                [644_i64, 1215, 1843, 2304],
+                [688_i64, 1215, 1843, 2304],
+            ),
+        ];
+
+        for (seed, models, target_model, starts, left_positions, right_positions) in cases {
+            let traces = starts
+                .into_iter()
+                .map(|start| {
+                    generated_target_trace_with_state(seed, start, models, target_model, 20_000)
+                })
+                .collect::<Vec<_>>();
+            let expected = [left_positions, right_positions];
+            let windows = traces
+                .iter()
+                .zip(expected)
+                .map(|(trace, positions)| {
+                    trace
+                        .windows(4)
+                        .find(|window| window.iter().map(|event| event.0).eq(positions.into_iter()))
+                        .map(|window| window.to_vec())
+                        .expect("diagnostic observation window exists")
+                })
+                .collect::<Vec<_>>();
+            let futures = windows
+                .iter()
+                .map(|window| {
+                    continue_target_trace(seed, window.last().unwrap(), target_model, 100_000)
+                })
+                .collect::<Vec<_>>();
+            let first_difference = futures[0]
+                .iter()
+                .zip(futures[1].iter())
+                .position(|(left, right)| left != right);
+            println!(
+                "seed={seed:08X} models={models} target_model={target_model} windows={:?} future_first_difference={first_difference:?} left_len={} right_len={} left_head={:?} right_head={:?}",
+                windows
+                    .iter()
+                    .map(|window| {
+                        (
+                            window.iter().map(|event| event.0).collect::<Vec<_>>(),
+                            window.iter().map(|event| event.1).collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                futures[0].len(),
+                futures[1].len(),
+                futures[0].iter().take(6).collect::<Vec<_>>(),
+                futures[1].iter().take(6).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_initial_special_boundaries_keep_all_branch_starts() {
+        let base = 480_i64;
+        let scan_end = base + INITIAL_BRANCH_SCAN_SPAN;
+        let mut examples = Vec::new();
+
+        // 実際のSFMT列から、基準位置の近傍に特殊値が2つ以上あるSeedを探す。
+        // ここで見つけた開始位置は、通常の基準Timelineと各-5分岐Timelineの候補になる。
+        for seed in 0_u32..50_000 {
+            let values =
+                generate_u64_values_from(seed, base as usize, (scan_end - base + 1) as usize);
+            let search_values = SearchValues::new(base, values.clone());
+            let starts = candidate_start_positions(base, base + 100, &search_values);
+            if starts.len() < 3 {
+                continue;
+            }
+            let special_starts = (base..=scan_end)
+                .filter(|position| {
+                    search_values
+                        .get(*position)
+                        .is_some_and(|value| value & 0x7f == 0)
+                })
+                .map(|position| position + 1)
+                .collect::<Vec<_>>();
+            assert_eq!(starts, {
+                let mut expected = vec![base];
+                expected.extend(special_starts.iter().copied());
+                expected.sort_unstable();
+                expected.dedup();
+                expected
+            });
+            examples.push((seed, special_starts, starts));
+            if examples.len() == 3 {
+                break;
+            }
+        }
+
+        assert!(
+            examples.len() == 3,
+            "近傍に-5分岐が2つ以上あるSeedを見つけられませんでした"
+        );
+        println!("複数-5分岐の検証Seed: {examples:#?}");
+    }
+
+    #[test]
+    #[ignore = "複数-5分岐で同じNPC番号の観測列衝突を探す診断。--ignored で実行"]
+    fn diagnostic_same_idx_distinct_sfmt_sequences() {
+        let base = 480_i64;
+        let models = 13_usize;
+        let required_events = 4_usize;
+        let mut checked_seeds = 0_usize;
+        let mut branch_seed_count = 0_usize;
+        let mut counterexamples = Vec::new();
+
+        'seeds: for seed in 0_u32..50_000 {
+            let values = generate_u64_values_from(
+                seed,
+                base as usize,
+                (INITIAL_BRANCH_SCAN_SPAN + 1) as usize,
+            );
+            let starts =
+                candidate_start_positions(base, base + 100, &SearchValues::new(base, values));
+            if starts.len() < 3 {
+                continue;
+            }
+            branch_seed_count += 1;
+            let traces = starts
+                .iter()
+                .map(|start| generated_target_streams(seed, *start, models, 600))
+                .collect::<Vec<_>>();
+            for left_start in 0..traces.len() {
+                for right_start in (left_start + 1)..traces.len() {
+                    for model in 0..models {
+                        let left = &traces[left_start][model];
+                        let right = &traces[right_start][model];
+                        if left.0.len() < required_events || right.0.len() < required_events {
+                            continue;
+                        }
+                        for left_window in 0..=left.0.len() - required_events {
+                            let left_positions =
+                                &left.0[left_window..left_window + required_events];
+                            let left_waits = &left.1[left_window..left_window + required_events];
+                            let left_intervals = left_waits
+                                .windows(2)
+                                .map(|pair| pair[1] - pair[0])
+                                .collect::<Vec<_>>();
+                            for right_window in 0..=right.0.len() - required_events {
+                                let right_positions =
+                                    &right.0[right_window..right_window + required_events];
+                                let right_waits =
+                                    &right.1[right_window..right_window + required_events];
+                                let right_intervals = right_waits
+                                    .windows(2)
+                                    .map(|pair| pair[1] - pair[0])
+                                    .collect::<Vec<_>>();
+                                if left_intervals == right_intervals
+                                    && left_positions != right_positions
+                                {
+                                    counterexamples.push((
+                                        seed,
+                                        starts[left_start],
+                                        starts[right_start],
+                                        model,
+                                        left_positions.to_vec(),
+                                        right_positions.to_vec(),
+                                        left_intervals.clone(),
+                                    ));
+                                    if counterexamples.len() >= 5 {
+                                        break 'seeds;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            checked_seeds += 1;
+        }
+
+        println!(
+            "同一NPC番号・異なるSFMT列の間隔一致: checked_branch_seeds={branch_seed_count}, counterexamples={counterexamples:#?}"
+        );
+        assert!(checked_seeds > 0 || branch_seed_count > 0);
+        // これは「衝突が存在しない」ことを前提にするテストではない。
+        // 実機入力だけでは区別できない衝突を検出した記録として残す。
+    }
+
+    #[test]
+    #[ignore = "同一NPC番号の衝突候補についてremainとSFMTカーソルを確認する診断"]
+    fn diagnostic_seed_0000123a_compare_remain_after_matching_blinks() {
+        let seed = 0x0000_123a;
+        let models = 13_usize;
+        let target_model = 10_usize;
+        let left = generated_target_trace_with_state(seed, 482, models, target_model, 600);
+        let right = generated_target_trace_with_state(seed, 508, models, target_model, 600);
+        println!("seed=0000123A left_start=482 trace={left:#?}");
+        println!("seed=0000123A right_start=508 trace={right:#?}");
+        assert!(left.len() >= 4 && right.len() >= 4);
+    }
+
+    #[test]
+    #[ignore = "合流前に同じNPC番号の観測列が衝突するケースを走査する診断"]
+    fn diagnostic_post_merge_unresolved_same_model_cases() {
+        let base = 480_i64;
+        let required_events = 4_usize;
+        let model_counts = [5_usize, 10, 13, 20, 22];
+        let mut checked = 0_usize;
+        let mut unresolved = Vec::new();
+
+        'seeds: for seed in 0_u32..10_000 {
+            let values = generate_u64_values_from(
+                seed,
+                base as usize,
+                (INITIAL_BRANCH_SCAN_SPAN + 1) as usize,
+            );
+            let starts =
+                candidate_start_positions(base, base + 100, &SearchValues::new(base, values));
+            if starts.len() < 2 {
+                continue;
+            }
+            checked += 1;
+            for &models in &model_counts {
+                for target_model in 0..models {
+                    let model_traces = starts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, start)| {
+                            (
+                                *start,
+                                generated_target_trace_with_state(
+                                    seed,
+                                    *start,
+                                    models,
+                                    target_model,
+                                    600,
+                                ),
+                                index,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    for left in &model_traces {
+                        if left.1.len() < required_events {
+                            continue;
+                        }
+                        for left_window in left.1.windows(required_events) {
+                            let left_intervals = left_window
+                                .windows(2)
+                                .map(|pair| pair[1].1 - pair[0].1)
+                                .collect::<Vec<_>>();
+                            for right in &model_traces {
+                                if right.0 <= left.0 || right.1.len() < required_events {
+                                    continue;
+                                }
+                                if right.1.windows(required_events).any(|right_window| {
+                                    let right_intervals = right_window
+                                        .windows(2)
+                                        .map(|pair| pair[1].1 - pair[0].1)
+                                        .collect::<Vec<_>>();
+                                    if left_intervals != right_intervals {
+                                        return false;
+                                    }
+                                    let left_state = left_window.last().unwrap();
+                                    let right_state = right_window.last().unwrap();
+                                    left_state.2 != right_state.2 || left_state.3 != right_state.3
+                                }) {
+                                    unresolved.push((
+                                        seed,
+                                        models,
+                                        target_model,
+                                        left.0,
+                                        right.0,
+                                        left_intervals.clone(),
+                                    ));
+                                    if unresolved.len() >= 5 {
+                                        break 'seeds;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        println!(
+            "合流前の同一NPC番号・間隔列衝突: checked_branch_seeds={checked}, examples={unresolved:#?}"
+        );
+        assert!(checked > 0);
+    }
+
+    #[test]
+    #[ignore = "同じNPC番号・同じ間隔列で状態が分かれる具体例の出力"]
+    fn diagnostic_seed_00000024_unresolved_same_model_case() {
+        let seed = 36_u32;
+        let models = 22_usize;
+        let target_model = 8_usize;
+        let base = 480_i64;
+        let values =
+            generate_u64_values_from(seed, base as usize, (INITIAL_BRANCH_SCAN_SPAN + 1) as usize);
+        let starts = candidate_start_positions(base, base + 100, &SearchValues::new(base, values));
+        for start in starts {
+            let trace = generated_target_trace_with_state(seed, start, models, target_model, 600);
+            for window in trace.windows(4) {
+                let intervals = window
+                    .windows(2)
+                    .map(|pair| pair[1].1 - pair[0].1)
+                    .collect::<Vec<_>>();
+                if intervals == [98, 114, 76] {
+                    let last = window.last().unwrap();
+                    println!(
+                        "seed=00000024 models=22 idx=8 start={start} positions={:?} waits={:?} cursor={} remain={:?}",
+                        window.iter().map(|event| event.0).collect::<Vec<_>>(),
+                        window.iter().map(|event| event.1).collect::<Vec<_>>(),
+                        last.2,
+                        last.3,
+                    );
+                }
+            }
+        }
+
+        let left = generated_target_trace_with_state(seed, 480, models, target_model, 600);
+        let right = generated_target_trace_with_state(seed, 491, models, target_model, 600);
+        let left_window = left
+            .windows(4)
+            .find(|window| {
+                window
+                    .windows(2)
+                    .map(|pair| pair[1].1 - pair[0].1)
+                    .collect::<Vec<_>>()
+                    == [98, 114, 76]
+            })
+            .unwrap();
+        let right_window = right
+            .windows(4)
+            .find(|window| {
+                window
+                    .windows(2)
+                    .map(|pair| pair[1].1 - pair[0].1)
+                    .collect::<Vec<_>>()
+                    == [98, 114, 76]
+            })
+            .unwrap();
+        let left_future =
+            continue_target_trace(seed, left_window.last().unwrap(), target_model, 100_000);
+        let right_future =
+            continue_target_trace(seed, right_window.last().unwrap(), target_model, 100_000);
+        let first_difference = left_future
+            .iter()
+            .zip(right_future.iter())
+            .position(|(left, right)| left != right);
+        println!(
+            "seed=00000024 future target events: left={} right={} first_difference={first_difference:?}",
+            left_future.len(),
+            right_future.len(),
+        );
+    }
+
+    #[test]
+    #[ignore = "開始480/491からSFMT5122までの消費経路を確認する診断"]
+    fn diagnostic_seed_00000024_flow_to_sfmt_5122() {
+        for start in [480_i64, 491_i64] {
+            let values = generate_u64_values_from(36, start as usize, 8_000);
+            let mut status = ModelStatus::new(22);
+            let mut stream_cursor = start;
+            let mut value_index = 0;
+            let mut special_count = 0;
+            let mut target_blink_count = 0;
+            println!("start={start}");
+            for tick in 1..=1_000 {
+                let before_cursor = stream_cursor;
+                let (_used, consumed) = status.next_state_with_positions(|| {
+                    let position = stream_cursor;
+                    let value = values[value_index];
+                    value_index += 1;
+                    stream_cursor += 1;
+                    (position, value)
+                });
+                let special = consumed
+                    .iter()
+                    .filter(|event| !event.blink && event.value & 0x7f == 0)
+                    .map(|event| (event.model, event.position))
+                    .collect::<Vec<_>>();
+                let target_blinks = consumed
+                    .iter()
+                    .filter(|event| event.model == 8 && event.blink)
+                    .map(|event| event.position)
+                    .collect::<Vec<_>>();
+                if !special.is_empty() {
+                    special_count += special.len();
+                }
+                if !target_blinks.is_empty() {
+                    target_blink_count += target_blinks.len();
+                }
+                if !special.is_empty() || !target_blinks.is_empty() {
+                    println!(
+                        "  tick={tick:>3} cursor={before_cursor}->{stream_cursor} special_models={special:?} target8_blinks={target_blinks:?} remain8={} total_special={special_count} target8_count={target_blink_count}",
+                        status.remain[8]
+                    );
+                }
+                if target_blinks.iter().any(|position| *position >= 5_122) {
+                    println!("  reached target SFMT 5122 at tick={tick}");
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "同じNPC番号・同じSFMTカーソル・対象remain一致でも将来分岐するかの診断"]
+    fn diagnostic_same_target_state_but_other_models_diverge() {
+        let base = 480_i64;
+        let required_events = 4_usize;
+        let model_counts = [5_usize, 10, 13, 20, 22];
+        let mut checked = 0_usize;
+        let mut examples = Vec::new();
+
+        'seeds: for seed in 0_u32..500 {
+            let values = generate_u64_values_from(
+                seed,
+                base as usize,
+                (INITIAL_BRANCH_SCAN_SPAN + 1) as usize,
+            );
+            let starts =
+                candidate_start_positions(base, base + 100, &SearchValues::new(base, values));
+            if starts.len() < 2 {
+                continue;
+            }
+            checked += 1;
+            for &models in &model_counts {
+                for target_model in 0..models {
+                    let traces = starts
+                        .iter()
+                        .map(|start| {
+                            generated_target_trace_with_state(
+                                seed,
+                                *start,
+                                models,
+                                target_model,
+                                600,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    for left_index in 0..traces.len() {
+                        for right_index in (left_index + 1)..traces.len() {
+                            for left_window in traces[left_index].windows(required_events) {
+                                let left_intervals = left_window
+                                    .windows(2)
+                                    .map(|pair| pair[1].1 - pair[0].1)
+                                    .collect::<Vec<_>>();
+                                let left_last = left_window.last().unwrap();
+                                for right_window in traces[right_index].windows(required_events) {
+                                    let right_intervals = right_window
+                                        .windows(2)
+                                        .map(|pair| pair[1].1 - pair[0].1)
+                                        .collect::<Vec<_>>();
+                                    let right_last = right_window.last().unwrap();
+                                    if left_intervals != right_intervals
+                                        || left_last.2 != right_last.2
+                                        || left_last.3[target_model] != right_last.3[target_model]
+                                        || left_last.3 == right_last.3
+                                    {
+                                        continue;
+                                    }
+                                    let left_future =
+                                        continue_target_trace(seed, left_last, target_model, 5_000);
+                                    let right_future = continue_target_trace(
+                                        seed,
+                                        right_last,
+                                        target_model,
+                                        5_000,
+                                    );
+                                    if left_future != right_future {
+                                        examples.push((
+                                            seed,
+                                            models,
+                                            target_model,
+                                            starts[left_index],
+                                            starts[right_index],
+                                            left_intervals.clone(),
+                                            left_future.len(),
+                                            right_future.len(),
+                                        ));
+                                        if examples.len() >= 5 {
+                                            break 'seeds;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        println!(
+            "同一対象モデル状態からの将来分岐: checked_branch_seeds={checked}, examples={examples:#?}"
+        );
+        assert!(checked > 0);
+    }
+
+    fn synthetic_result(
+        start_consumption: i64,
+        observed_model: usize,
+        intervals: Vec<i64>,
+        target_consumptions: Vec<i64>,
+    ) -> FieldResult {
+        FieldResult {
+            start_consumption,
+            first_wait_frame: 50,
+            last_wait_frame: 50 + intervals.iter().sum::<i64>(),
+            first_consumption: target_consumptions[0],
+            last_consumption: *target_consumptions.last().unwrap(),
+            intervals,
+            target_consumptions,
+            next_blink_wait_frame: 0,
+            target_wait_frame: None,
+            target_exact: None,
+            target_frame_before: None,
+            target_frame_after: None,
+            observed_model,
+            models: 13,
+            timeline: Vec::new(),
+            target_blink_count: None,
+            timeline_cursor: None,
+            target_cursor: None,
+        }
+    }
+
+    #[test]
+    fn observable_candidates_keep_different_sfmt_positions() {
+        let candidates = vec![
+            synthetic_result(1_000, 5, vec![506, 362], vec![1288, 3739, 5522]),
+            synthetic_result(1_020, 12, vec![502, 362], vec![1284, 3739, 5522]),
+        ];
+        let merged = merge_observable_candidates(candidates);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].start_consumption, 1_000);
+    }
+
+    #[test]
+    fn observable_candidates_stay_separate_when_target_stream_diverges() {
+        let candidates = vec![
+            synthetic_result(1_000, 5, vec![506, 362], vec![1288, 3739, 5522]),
+            synthetic_result(1_020, 12, vec![502, 362], vec![1284, 3739, 5523]),
+        ];
+        let merged = merge_observable_candidates(candidates);
+        assert_eq!(merged.len(), 2);
+    }
+
+    fn generated_target_streams(
+        seed: u32,
+        start_consumption: i64,
+        models: usize,
+        ticks: usize,
+    ) -> Vec<(Vec<i64>, Vec<i64>)> {
+        let values = generate_u64_values_from(
+            seed,
+            start_consumption as usize,
+            models.saturating_mul(ticks).saturating_add(64),
+        );
+        let mut status = ModelStatus::new(models);
+        let mut stream_cursor = start_consumption;
+        let mut value_index = 0;
+        let mut streams = vec![(Vec::new(), Vec::new()); models];
+        for tick in 1..=ticks {
+            let (_used, consumed) = status.next_state_with_positions(|| {
+                let position = stream_cursor;
+                let value = values[value_index];
+                value_index += 1;
+                stream_cursor += 1;
+                (position, value)
+            });
+            for event in consumed.into_iter().filter(|event| event.blink) {
+                streams[event.model].0.push(event.position);
+                streams[event.model].1.push(tick as i64 * 2);
+            }
+        }
+        streams
+    }
+
+    fn generated_target_trace_with_state(
+        seed: u32,
+        start_consumption: i64,
+        models: usize,
+        target_model: usize,
+        ticks: usize,
+    ) -> Vec<(i64, i64, i64, Vec<i32>)> {
+        let values = generate_u64_values_from(
+            seed,
+            start_consumption as usize,
+            models.saturating_mul(ticks).saturating_add(64),
+        );
+        let mut status = ModelStatus::new(models);
+        let mut stream_cursor = start_consumption;
+        let mut value_index = 0;
+        let mut trace = Vec::new();
+        for tick in 1..=ticks {
+            let (_used, consumed) = status.next_state_with_positions(|| {
+                let position = stream_cursor;
+                let value = values[value_index];
+                value_index += 1;
+                stream_cursor += 1;
+                (position, value)
+            });
+            if consumed
+                .iter()
+                .any(|event| event.model == target_model && event.blink)
+            {
+                trace.push((
+                    consumed
+                        .iter()
+                        .find(|event| event.model == target_model && event.blink)
+                        .map(|event| event.position)
+                        .unwrap(),
+                    tick as i64 * 2,
+                    stream_cursor,
+                    status.remain.clone(),
+                ));
+            }
+        }
+        trace
+    }
+
+    fn continue_target_trace(
+        seed: u32,
+        last_event: &(i64, i64, i64, Vec<i32>),
+        target_model: usize,
+        ticks: usize,
+    ) -> Vec<(i64, i64)> {
+        let models = last_event.3.len();
+        let values = generate_u64_values_from(
+            seed,
+            last_event.2 as usize,
+            models.saturating_mul(ticks).saturating_add(64),
+        );
+        let mut status = ModelStatus {
+            remain: last_event.3.clone(),
+        };
+        let mut stream_cursor = last_event.2;
+        let mut value_index = 0;
+        let mut trace = Vec::new();
+        for tick in 1..=ticks {
+            let (_used, consumed) = status.next_state_with_positions(|| {
+                let position = stream_cursor;
+                let value = values[value_index];
+                value_index += 1;
+                stream_cursor += 1;
+                (position, value)
+            });
+            if let Some(event) = consumed
+                .into_iter()
+                .find(|event| event.model == target_model && event.blink)
+            {
+                trace.push((event.position, tick as i64 * 2));
+            }
+        }
+        trace
+    }
+
+    #[test]
+    fn generated_sfmt_patterns_merge_converged_candidates_and_keep_divergence() {
+        let mut tested_converged_pairs = 0;
+        let mut pseudo_seed = 0x1357_9bdf_u32;
+        for _ in 0..24 {
+            pseudo_seed = pseudo_seed
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223);
+            let seed = pseudo_seed;
+            for &models in &[5_usize, 10, 13, 20] {
+                let starts = [480_i64, 481, 482, 483, 484];
+                let traces = starts
+                    .iter()
+                    .map(|start| generated_target_streams(seed, *start, models, 400))
+                    .collect::<Vec<_>>();
+                for left_index in 0..starts.len() {
+                    for right_index in (left_index + 1)..starts.len() {
+                        for left_model in 0..models {
+                            let (left_positions, left_waits) = &traces[left_index][left_model];
+                            let left_intervals = left_waits
+                                .windows(2)
+                                .map(|pair| pair[1] - pair[0])
+                                .collect::<Vec<_>>();
+                            if left_intervals.len() < 2 {
+                                continue;
+                            }
+                            for right_model in 0..models {
+                                let (right_positions, right_waits) =
+                                    &traces[right_index][right_model];
+                                let right_intervals = right_waits
+                                    .windows(2)
+                                    .map(|pair| pair[1] - pair[0])
+                                    .collect::<Vec<_>>();
+                                if left_intervals.get(1..) != right_intervals.get(1..)
+                                    || left_positions.get(1..) != right_positions.get(1..)
+                                    || (left_intervals.first() == right_intervals.first()
+                                        && left_positions.first() == right_positions.first())
+                                {
+                                    continue;
+                                }
+                                let candidates = vec![
+                                    synthetic_result(
+                                        starts[left_index],
+                                        left_model,
+                                        left_intervals.clone(),
+                                        left_positions.clone(),
+                                    ),
+                                    synthetic_result(
+                                        starts[right_index],
+                                        right_model,
+                                        right_intervals,
+                                        right_positions.clone(),
+                                    ),
+                                ];
+                                assert_eq!(merge_observable_candidates(candidates).len(), 2);
+                                tested_converged_pairs += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            tested_converged_pairs > 0,
+            "ランダムに生成した範囲で収束する候補を見つけられませんでした"
+        );
+
+        let streams_a = generated_target_streams(1, 1_000, 13, 400);
+        let streams_b = generated_target_streams(1, 1_020, 13, 400);
+        let left = &streams_a[5];
+        let right = &streams_b[12];
+        let left_intervals = left
+            .1
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<Vec<_>>();
+        let right_intervals = right
+            .1
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<Vec<_>>();
+        assert_eq!(left_intervals.get(1..), right_intervals.get(1..));
+        assert_eq!(left.0.get(1..), right.0.get(1..));
+        assert_ne!(left.0.first(), right.0.first());
+        assert_eq!(
+            merge_observable_candidates(vec![
+                synthetic_result(1_000, 5, left_intervals.clone(), left.0.clone()),
+                synthetic_result(1_020, 12, right_intervals.clone(), right.0.clone()),
+            ])
+            .len(),
+            2
+        );
+
+        let mut divergent_positions = right.0.clone();
+        let last = divergent_positions
+            .last_mut()
+            .expect("収束ケースには複数の瞬きが必要です");
+        *last += 1;
+        assert_eq!(
+            merge_observable_candidates(vec![
+                synthetic_result(1_000, 5, left_intervals.clone(), left.0.clone()),
+                synthetic_result(1_020, 12, right_intervals, divergent_positions),
+            ])
+            .len(),
+            2
+        );
     }
 }

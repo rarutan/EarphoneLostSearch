@@ -1,9 +1,14 @@
 [package]
-name = "hatch_blink_search"
-version = "0.1.0"
+name = "earphone_lost_search"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Gen 7 blink timing assistant for egg RNG workflows"
+autobins = false
+
+[[bin]]
+name = "EarphoneLostSearch"
+path = "src/main.rs"
 
 [dependencies]
 eframe = "0.29"

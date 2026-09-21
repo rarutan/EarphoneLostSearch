@@ -212,7 +212,10 @@ pub(crate) fn field_ui(
                 egui::pos2(panel_rect.left() + PANEL_PADDING, correction_top + 4.0),
                 CORRECTION_LABEL_SIZE,
             );
-            ui.put(correction_label_rect, egui::Label::new(texts.correction()));
+            ui.put(
+                correction_label_rect,
+                egui::Label::new(texts.blink_correction()),
+            );
             let correction_rect = egui::Rect::from_min_size(
                 egui::pos2(panel_rect.center().x - 78.0, correction_top),
                 CORRECTION_CONTROL_SIZE,
@@ -541,11 +544,43 @@ fn field_observation_ui(
             ui.label(texts.tolerance());
             numeric_text_edit(ui, &mut state.tolerance, 72.0, false, false);
         });
-        ui.horizontal(|ui| {
-            ui.label(texts.model_number());
-            numeric_text_edit(ui, &mut state.target_model, 72.0, false, false);
-        });
     });
+    let row_width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        egui::vec2(row_width, 24.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.add_enabled_ui(editable, |ui| {
+                ui.label(texts.model_number());
+                let response = numeric_text_edit(ui, &mut state.target_model, 72.0, false, false);
+                if response.lost_focus() && state.target_model.trim().is_empty() {
+                    state.target_model = "0".to_string();
+                }
+            });
+            if let Some(matched) = state.selected_npc_number_match() {
+                let remaining = ui.available_width();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(remaining, 24.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let color = if matched {
+                            color_scheme.colors_for_ui(ui).target_yes
+                        } else {
+                            color_scheme.colors_for_ui(ui).target_no
+                        };
+                        ui.colored_label(
+                            color,
+                            format!(
+                                "{}:{}",
+                                texts.model_number(),
+                                if matched { "○" } else { "×" }
+                            ),
+                        );
+                    },
+                );
+            }
+        },
+    );
     let after = (
         state.range_start.clone(),
         state.range_end.clone(),
@@ -812,11 +847,7 @@ fn field_settings_ui(
                 ui.allocate_space(egui::vec2(ui.available_width(), target_row_height));
             }
             let npc_row_height = DERIVED_ROW_HEIGHT;
-            if !calculating
-                && state.results.len() == 1
-                && state.multiple_npc_search
-                && state.results.len() == 1
-            {
+            if !calculating && state.results.len() == 1 && state.multiple_npc_search {
                 if let Some(result) = state.results.get(state.selected_result) {
                     let npc_text = result.models.saturating_sub(1).to_string();
                     ui.allocate_ui_with_layout(

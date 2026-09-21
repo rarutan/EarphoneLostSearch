@@ -3,15 +3,17 @@
 //! 値の永続化と適用はアプリケーション状態へ返し、画面側では入力欄と
 //! コントロールの配置だけを扱う。
 
+use crate::application::field::FieldState;
 use crate::application::state::AppState;
 use crate::ui::i18n::{Language, Texts};
 use crate::ui::widgets::{
-    apply_color_scheme, consumption_spinner, numeric_text_edit, ColorScheme, FlashMode,
+    apply_color_scheme, consumption_spinner, nonnegative_frame_spinner_with_commit,
+    numeric_text_edit, ColorScheme, FlashMode,
 };
 use eframe::egui;
 
 const SETTING_INPUT_WIDTH: f32 = 120.0;
-const PRE_ROTOM_CONTROL_WIDTH: f32 = 310.0;
+const RIGHT_SETTING_CONTROL_WIDTH: f32 = 310.0;
 const LANGUAGE_JAPANESE: &str = "日本語";
 const LANGUAGE_ENGLISH: &str = "English";
 
@@ -20,6 +22,7 @@ const LANGUAGE_ENGLISH: &str = "English";
 pub(crate) fn settings_ui(
     ui: &mut egui::Ui,
     state: &mut AppState,
+    field: &mut FieldState,
     language: &mut Language,
     color_scheme: &mut ColorScheme,
     beep_enabled: &mut bool,
@@ -35,6 +38,7 @@ pub(crate) fn settings_ui(
         state.fps.clone(),
         state.consider_pre_rotom_consumption,
         state.pre_rotom_consumption.clone(),
+        field.initial_branch_scan_span.clone(),
         *color_scheme,
         *beep_enabled,
         *keyboard_enabled,
@@ -47,9 +51,8 @@ pub(crate) fn settings_ui(
         ui.horizontal(|ui| {
             ui.label(texts.fps());
             numeric_text_edit(ui, &mut state.fps, SETTING_INPUT_WIDTH, true, false);
-            // FPS入力と重ならないように、右端の設定領域を固定幅で確保する。
             let available = ui.available_width();
-            let control_width = PRE_ROTOM_CONTROL_WIDTH.min(available.max(0.0));
+            let control_width = RIGHT_SETTING_CONTROL_WIDTH.min(available.max(0.0));
             ui.add_space((available - control_width).max(0.0));
             ui.allocate_ui_with_layout(
                 egui::vec2(control_width, ui.spacing().interact_size.y),
@@ -78,6 +81,34 @@ pub(crate) fn settings_ui(
                 SETTING_INPUT_WIDTH,
                 true,
                 false,
+            );
+            let available = ui.available_width();
+            let control_width = RIGHT_SETTING_CONTROL_WIDTH.min(available.max(0.0));
+            ui.add_space((available - control_width).max(0.0));
+            ui.allocate_ui_with_layout(
+                egui::vec2(control_width, ui.spacing().interact_size.y),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let (changed, committed) = nonnegative_frame_spinner_with_commit(
+                        ui,
+                        &mut field.initial_branch_scan_span,
+                        SETTING_INPUT_WIDTH,
+                        1,
+                        *wheel_offset_enabled,
+                    );
+                    if (changed || committed)
+                        && field
+                            .initial_branch_scan_span
+                            .parse::<i64>()
+                            .is_ok_and(|value| {
+                                value > crate::application::field::MAX_INITIAL_BRANCH_SCAN_SPAN
+                            })
+                    {
+                        field.initial_branch_scan_span =
+                            crate::application::field::MAX_INITIAL_BRANCH_SCAN_SPAN.to_string();
+                    }
+                    ui.label(texts.initial_branch_scan_span());
+                },
             );
         });
         ui.horizontal(|ui| {
@@ -135,6 +166,7 @@ pub(crate) fn settings_ui(
             state.fps.clone(),
             state.consider_pre_rotom_consumption,
             state.pre_rotom_consumption.clone(),
+            field.initial_branch_scan_span.clone(),
             *color_scheme,
             *beep_enabled,
             *keyboard_enabled,

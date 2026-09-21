@@ -64,6 +64,8 @@ pub(crate) struct PersistedField {
     pub(crate) range_after_start: String,
     pub(crate) npc_count: String,
     pub(crate) multiple_npc_search: bool,
+    #[serde(default = "default_initial_branch_scan_span")]
+    pub(crate) initial_branch_scan_span: String,
     pub(crate) target_model: String,
     pub(crate) target_mode_known: bool,
     pub(crate) actual_frame: String,
@@ -73,6 +75,10 @@ pub(crate) struct PersistedField {
     pub(crate) use_offset: bool,
     pub(crate) table_follow_current: bool,
     pub(crate) adjust: i64,
+}
+
+fn default_initial_branch_scan_span() -> String {
+    defaults::FIELD_INITIAL_BRANCH_SCAN_SPAN.into()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -140,6 +146,7 @@ impl Default for PersistedField {
             range_after_start: state.range_after_start,
             npc_count: state.npc_count,
             multiple_npc_search: state.multiple_npc_search,
+            initial_branch_scan_span: state.initial_branch_scan_span,
             target_model: state.target_model,
             target_mode_known: state.target_mode == FieldTargetMode::Known,
             actual_frame: state.actual_frame,
@@ -191,6 +198,8 @@ fn app_state_path() -> Option<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use crate::application::defaults;
+
     use super::PersistedAppState;
 
     #[test]
@@ -206,5 +215,15 @@ mod tests {
     fn missing_top_level_fields_use_defaults() {
         let decoded: PersistedAppState = serde_json::from_str("{}").expect("default state");
         assert_eq!(decoded, PersistedAppState::default());
+    }
+
+    #[test]
+    fn missing_branch_scan_setting_uses_the_default() {
+        let decoded: PersistedAppState =
+            serde_json::from_str(r#"{"field":{}}"#).expect("field defaults");
+        assert_eq!(
+            decoded.field.initial_branch_scan_span,
+            defaults::FIELD_INITIAL_BRANCH_SCAN_SPAN
+        );
     }
 }

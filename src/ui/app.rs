@@ -494,6 +494,7 @@ impl eframe::App for UiApp {
                     preferences_changed = settings_ui(
                         ui,
                         &mut self.state,
+                        &mut self.field,
                         &mut self.language,
                         &mut self.color_scheme,
                         &mut self.beep_enabled,
@@ -939,6 +940,7 @@ impl UiApp {
                 range_after_start: self.field.range_after_start.clone(),
                 npc_count: self.field.npc_count.clone(),
                 multiple_npc_search: self.field.multiple_npc_search,
+                initial_branch_scan_span: self.field.initial_branch_scan_span.clone(),
                 target_model: self.field.target_model.clone(),
                 target_mode_known: self.field.target_mode == FieldTargetMode::Known,
                 actual_frame: self.field.actual_frame.clone(),
@@ -998,7 +1000,12 @@ impl UiApp {
         self.field.range_after_start = field.range_after_start;
         self.field.npc_count = field.npc_count;
         self.field.multiple_npc_search = field.multiple_npc_search;
-        self.field.target_model = field.target_model;
+        self.field.initial_branch_scan_span = field.initial_branch_scan_span;
+        self.field.target_model = if field.target_model.trim().is_empty() {
+            "0".to_string()
+        } else {
+            field.target_model
+        };
         // フィールドはNPC番号を明示する入力モードだけを使用する。
         // 保存データを読み込む際も、この指定番号の経路へ正規化する。
         self.field.target_mode = FieldTargetMode::Known;
@@ -1790,15 +1797,23 @@ impl UiApp {
                 self.field.mark_timeline_ready();
                 let unique_status =
                     "現在位置を一意に特定しました。追加の瞬き入力は停止しています。";
-                if self.field.can_start_timer()
-                    && self.field.start_blink_timer(self.state.fps_value()).is_ok()
-                {
-                    self.field.set_info_status(unique_status);
+                if self.field.can_start_timer() {
+                    match self.field.start_blink_timer(self.state.fps_value()) {
+                        Ok(()) => {
+                            self.play_candidate_confirmed();
+                            self.field.set_info_status(unique_status);
+                        }
+                        Err(_) => {
+                            self.field_timer_retry = true;
+                            self.field
+                                .set_info_status(format!("{unique_status}（計算中です…）"));
+                            ctx.request_repaint_after(Duration::from_millis(50));
+                        }
+                    }
                 } else {
                     self.field
-                        .set_actionable_status(format!("{unique_status}（再観測してください）"));
+                        .set_info_status(format!("{unique_status}（計算中です…）"));
                 }
-                self.play_candidate_confirmed();
             } else {
                 self.field.set_info_status(format!(
                     "{survivors}件の候補があります。位置が一意になるまで観測を続けてください。"
@@ -1932,9 +1947,28 @@ impl UiApp {
                 // Targetだけの再評価で観測候補を置き換えない。Timeline、開始位置、remain状態、
                 // 観測アンカーはTargetから独立しており、到達可否とTargetまでの時間だけを更新する。
                 if self.field.target_research_pending && self.field.results.len() == 1 {
+                    let selected_key =
+                        self.field
+                            .results
+                            .get(self.field.selected_result)
+                            .map(|result| {
+                                (
+                                    result.start_consumption,
+                                    result.models,
+                                    result.observed_model,
+                                )
+                            });
                     if let (Some(current), Some(refined)) = (
                         self.field.results.get_mut(self.field.selected_result),
-                        outcome.results.first(),
+                        outcome.results.iter().find(|result| {
+                            selected_key.is_some_and(|key| {
+                                key == (
+                                    result.start_consumption,
+                                    result.models,
+                                    result.observed_model,
+                                )
+                            })
+                        }),
                     ) {
                         current.target_wait_frame = refined.target_wait_frame;
                         current.target_exact = refined.target_exact;
@@ -1949,7 +1983,7 @@ impl UiApp {
                     return;
                 }
                 self.field.target_research_pending = false;
-                self.field.results = outcome.results;
+                self.field.results = self.field.normalize_search_results(outcome.results);
                 self.field.search_exhausted = self.field.results.is_empty();
                 self.jobs.field_timeline_extension_blocked = false;
                 self.field.idx_fallback_indices.clear();
@@ -1981,17 +2015,26 @@ impl UiApp {
                         return;
                     }
                     // Timelineが一意になったら瞬き合わせのカウントダウンを開始する。
-                    // 候補確定音はタイマー生成とは独立して鳴らす。検索中に予測瞬き時刻を
-                    // 過ぎていても、候補確定を音で知らせる必要がある。
-                    let timer_started = self.field.can_start_timer()
-                        && self.field.start_blink_timer(self.state.fps_value()).is_ok();
-                    self.play_candidate_confirmed();
-                    if timer_started {
-                        self.field.set_info_status(unique_status);
+                    // 先読みキューが空などの理由でタイマーを開始できない場合は、
+                    // 確定音だけが先に鳴らないよう、タイマー開始後に通知する。
+                    if self.field.can_start_timer() {
+                        match self.field.start_blink_timer(self.state.fps_value()) {
+                            Ok(()) => {
+                                self.play_candidate_confirmed();
+                                self.field.set_info_status(unique_status);
+                            }
+                            Err(_) => {
+                                // 先読み末尾へ到達した場合は、次のチャンクをバックグラウンド
+                                // で追加してから同じ候補のタイマー開始を再試行する。
+                                self.field_timer_retry = true;
+                                self.field
+                                    .set_info_status(format!("{unique_status}（計算中です…）"));
+                                ctx.request_repaint_after(Duration::from_millis(50));
+                            }
+                        }
                     } else {
-                        self.field.set_actionable_status(format!(
-                            "{unique_status}（再観測してください）"
-                        ));
+                        self.field
+                            .set_info_status(format!("{unique_status}（計算中です…）"));
                     }
                 }
             }
@@ -2340,6 +2383,13 @@ impl UiApp {
                 return;
             }
         };
+        let initial_branch_scan_span = match self.field.initial_branch_scan_span_value() {
+            Ok(value) => value,
+            Err(message) => {
+                self.field.set_search_range_status(message);
+                return;
+            }
+        };
         // 瞬き候補が一意になった後のTarget編集では、その候補のモデル数と
         // 観測idxを再利用する。NPC範囲を再展開すると別設定の先頭結果で
         // 選択済みTimelineを置き換えるためである。
@@ -2410,12 +2460,14 @@ impl UiApp {
                     Some(cancel.as_ref()),
                 )
             }?;
-            let result = crate::application::field::search_with_npc_range_with_pool_cancelable(
-                &configs,
-                &pool,
-                target_mode,
-                Some(cancel.as_ref()),
-            )?;
+            let result =
+                crate::application::field::search_with_npc_range_with_pool_cancelable_and_span(
+                    &configs,
+                    &pool,
+                    target_mode,
+                    initial_branch_scan_span,
+                    Some(cancel.as_ref()),
+                )?;
             repaint.request_repaint();
             Ok((result, pool))
         }));
@@ -2567,7 +2619,7 @@ fn correction_ui(
         panel_rect.min + egui::vec2(2.0, 4.0),
         egui::vec2(72.0, 24.0),
     );
-    ui.put(label_rect, egui::Label::new(texts.correction()));
+    ui.put(label_rect, egui::Label::new(texts.blink_correction()));
 
     let spinner_rect = egui::Rect::from_center_size(
         egui::pos2(panel_rect.center().x, panel_rect.center().y),

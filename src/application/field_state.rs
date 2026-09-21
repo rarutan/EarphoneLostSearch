@@ -39,6 +39,8 @@ pub struct FieldState {
     pub npc_count: String,
     /// NPC欄を`始点~終点`として展開する検索モード。
     pub multiple_npc_search: bool,
+    /// 初期読み込み境界（-5分岐）を基準位置から探す幅。
+    pub initial_branch_scan_span: String,
     /// 観測対象idx。0は主人公、1以上はNPC。
     pub target_model: String,
     /// 実際に取得できたTargetFrame。idx自動判定に使用する。
@@ -108,6 +110,7 @@ impl Default for FieldState {
             range_after_start: defaults::FIELD_RANGE_AFTER_START.into(),
             npc_count: defaults::FIELD_NPC_COUNT.into(),
             multiple_npc_search: false,
+            initial_branch_scan_span: defaults::FIELD_INITIAL_BRANCH_SCAN_SPAN.into(),
             target_model: defaults::FIELD_TARGET_MODEL.into(),
             actual_frame: String::new(),
             tolerance: defaults::FIELD_TOLERANCE.into(),
@@ -170,6 +173,108 @@ impl FieldState {
     pub(crate) fn clear_status(&mut self) {
         self.status.clear();
         self.status_kind = StatusKind::Informational;
+    }
+
+    /// 観測列に一致した候補を、完全な現在状態が同じ場合だけ統合する。
+    ///
+    /// 異なる開始位置が観測対象の瞬きだけ同じになる場合、有限の観測列から
+    /// 全Timelineの同一性は保証できない。そのため、保存済みカーソルがある候補は
+    /// 全モデルの状態とSFMTカーソルが一致した場合だけ統合する。過去の対象NPCの
+    /// SFMT位置列や間隔列は、現在状態が一致した候補を分ける理由にはしない。
+    /// カーソルを持たない合成結果については内部状態を比較できないため、従来どおり
+    /// 観測履歴と開始位置が完全一致する場合だけ統合する。
+    pub(crate) fn normalize_search_results(
+        &mut self,
+        results: Vec<FieldResult>,
+    ) -> Vec<FieldResult> {
+        let requested = self.target_model.trim().parse::<usize>().ok();
+        let mut groups: Vec<Vec<FieldResult>> = Vec::new();
+        for result in results {
+            let same_window = |candidate: &FieldResult| {
+                let same_identity = candidate.models == result.models
+                    && candidate.observed_model == result.observed_model;
+                if !same_identity {
+                    return false;
+                }
+
+                let has_full_state = candidate
+                    .target_cursor
+                    .as_ref()
+                    .or(candidate.timeline_cursor.as_ref())
+                    .is_some()
+                    && result
+                        .target_cursor
+                        .as_ref()
+                        .or(result.timeline_cursor.as_ref())
+                        .is_some();
+                if has_full_state {
+                    // 現在状態が完全一致していれば、異なる開始位置や過去の
+                    // target_consumptionsを持つ候補でも同じTimelineへ合流している。
+                    same_full_timeline_state(candidate, &result)
+                } else {
+                    // 状態を保存していないテスト用・合成候補は、観測履歴まで
+                    // 一致しなければ同一性を判定できない。
+                    candidate.start_consumption == result.start_consumption
+                        && candidate.intervals == result.intervals
+                        && candidate.target_consumptions == result.target_consumptions
+                        && same_full_timeline_state(candidate, &result)
+                }
+            };
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.first().is_some_and(same_window))
+            {
+                group.push(result);
+            } else {
+                groups.push(vec![result]);
+            }
+        }
+
+        let requested_groups = requested
+            .map(|index| {
+                groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, group)| group.iter().any(|result| result.observed_model == index))
+                    .map(|(group_index, _)| group_index)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let selected_group =
+            (requested.is_some() && requested_groups.len() == 1).then(|| requested_groups[0]);
+        let mut representatives = Vec::with_capacity(selected_group.map_or(groups.len(), |_| 1));
+        for (group_index, group) in groups.iter().enumerate() {
+            if selected_group.is_some_and(|selected| selected != group_index) {
+                continue;
+            }
+            let representative = requested
+                .and_then(|index| group.iter().find(|result| result.observed_model == index))
+                .or_else(|| group.first())
+                .cloned();
+            if let Some(representative) = representative {
+                representatives.push(representative);
+            }
+        }
+        representatives.sort_by_key(|result| {
+            (
+                result.start_consumption,
+                result.models,
+                result.first_wait_frame,
+                result.last_wait_frame,
+            )
+        });
+        representatives
+    }
+
+    /// 確定済みTimelineの観測NPC番号と、条件設定のNPC番号を直接比較する。
+    ///
+    /// 表示用の派生値であり、検索やタイマーの状態として保存しない。
+    pub(crate) fn selected_npc_number_match(&self) -> Option<bool> {
+        let requested = self.target_model.trim().parse::<usize>().ok();
+        match (requested, self.results.as_slice()) {
+            (Some(requested), [result]) => Some(result.observed_model == requested),
+            _ => None,
+        }
     }
 
     pub(crate) fn status_is_field_notice(&self) -> bool {
@@ -573,19 +678,34 @@ impl FieldState {
         let sfmt = self.timeline_sfmt.as_mut().expect("checked above");
         let mut events = Vec::new();
         while cursor.tick < chunk_end {
-            let (used, blink) = cursor.status.next_state(sfmt);
-            cursor.stream_cursor = cursor.stream_cursor.saturating_add(used as i64);
+            let mut target_consumption = None;
+            let (used, consumed) = cursor.status.next_state_with_positions(|| {
+                let position = cursor.stream_cursor;
+                let value = sfmt.next_u64();
+                cursor.stream_cursor = cursor.stream_cursor.saturating_add(1);
+                (position, value)
+            });
             cursor.consumption = cursor.consumption.saturating_add(used as i64);
             cursor.tick = cursor.tick.saturating_add(1);
-            if blink.contains(&(config.target_model as u8)) {
-                events.push((cursor.tick.saturating_mul(2), cursor.consumption));
+            if let Some(event) = consumed
+                .into_iter()
+                .find(|event| event.model == config.target_model && event.blink)
+            {
+                target_consumption = Some(event.position);
+            }
+            if target_consumption.is_some() {
+                events.push((
+                    cursor.tick.saturating_mul(2),
+                    cursor.consumption,
+                    target_consumption,
+                ));
             }
             if cursor.consumption >= MAX_SFMT_FRAME {
                 break;
             }
         }
         let appended = events.len();
-        for (wait_frame, consumption) in events {
+        for (wait_frame, consumption, target_consumption) in events {
             if let Some(previous) = result.timeline.last_mut() {
                 previous.duration_frames = wait_frame.saturating_sub(previous.timeline_frame);
             }
@@ -594,6 +714,7 @@ impl FieldState {
                 timeline_frame: wait_frame,
                 duration_frames: 0,
                 observed: false,
+                target_consumption,
             });
         }
         if let Some(target_wait) = result.target_wait_frame {
@@ -689,10 +810,11 @@ impl FieldState {
             else {
                 continue;
             };
-            let (next_wait, next_consumption) = {
+            let next = {
                 let row = &mut result.timeline[next_index];
-                (row.timeline_frame, row.frame)
+                (row.timeline_frame, row.frame, row.target_consumption)
             };
+            let (next_wait, next_consumption, next_target_consumption) = next;
             let actual = next_wait.saturating_sub(previous_last);
             if (actual - expected).abs() > tolerance {
                 continue;
@@ -705,6 +827,9 @@ impl FieldState {
             result.last_wait_frame = next_wait;
             result.last_consumption = next_consumption;
             result.intervals.push(actual);
+            if let Some(target_consumption) = next_target_consumption {
+                result.target_consumptions.push(target_consumption);
+            }
             result.next_blink_wait_frame = result
                 .timeline
                 .iter()
@@ -749,18 +874,24 @@ impl FieldState {
         let range_start = parse_nonnegative(&self.range_start, "検索範囲の始点")?;
         let range_end = parse_nonnegative(&self.range_end, "検索範囲の終点")?;
         let npc_counts = parse_npc_counts(&self.npc_count, self.multiple_npc_search)?;
-        let target_model = if self.target_mode == FieldTargetMode::Unknown {
-            0
-        } else {
-            usize::try_from(parse_nonnegative(&self.target_model, "NPC番号")?)
-                .map_err(|_| "NPC番号が大きすぎます。".to_string())?
-        };
+        // NPC番号は検索開始時のTimelineを絞る条件にしないが、入力自体は必須とする。
+        // 空欄を0へ暗黙変換すると、未入力のまま主人公として検索されるため、
+        // UIの入力ミスと本当に0を指定したケースを区別できなくなる。
+        let target_model = usize::try_from(parse_nonnegative(&self.target_model, "NPC番号")?)
+            .map_err(|_| "NPC番号が大きすぎます。".to_string())?;
         let tolerance = parse_nonnegative(&self.tolerance, "許容差")?;
         let target_consumption = if self.target_consumption.trim().is_empty() {
             None
         } else {
             Some(parse_nonnegative(&self.target_consumption, "目標消費数")?)
         };
+        let branch_span = parse_nonnegative(&self.initial_branch_scan_span, "初期分岐探索範囲")?;
+        if branch_span > crate::application::field::MAX_INITIAL_BRANCH_SCAN_SPAN {
+            return Err(format!(
+                "初期分岐探索範囲は0～{}の範囲で入力してください。",
+                crate::application::field::MAX_INITIAL_BRANCH_SCAN_SPAN
+            ));
+        }
 
         let mut configs = Vec::with_capacity(npc_counts.len());
         for npc_count in npc_counts {
@@ -772,11 +903,6 @@ impl FieldState {
                     "NPC数が大きすぎます。主人公を含むモデル数は{}以下にしてください。",
                     MAX_MODELS
                 ));
-            }
-            // idx不明は後段で全モデルを照合する。既知idxがNPC範囲の下限外にある
-            // 設定は、そのidxに対して無効なモデル数として扱う。
-            if self.target_mode == FieldTargetMode::Known && target_model >= models {
-                continue;
             }
             configs.push(FieldConfig {
                 seed,
@@ -799,6 +925,18 @@ impl FieldState {
             validate_static_config(config)?;
         }
         Ok(configs)
+    }
+
+    /// 設定画面の初期分岐探索範囲を検証して返す。
+    pub fn initial_branch_scan_span_value(&self) -> Result<i64, String> {
+        let value = parse_nonnegative(&self.initial_branch_scan_span, "初期分岐探索範囲")?;
+        if value > crate::application::field::MAX_INITIAL_BRANCH_SCAN_SPAN {
+            return Err(format!(
+                "初期分岐探索範囲は0～{}の範囲で入力してください。",
+                crate::application::field::MAX_INITIAL_BRANCH_SCAN_SPAN
+            ));
+        }
+        Ok(value)
     }
 
     pub fn start_blink_timer(&mut self, fps: f64) -> Result<(), String> {
@@ -1150,7 +1288,7 @@ impl FieldState {
             - game_frames_to_seconds(self.adjust as f64, fps);
         let remaining = total - anchor.elapsed().as_secs_f64();
         if remaining <= 0.0 {
-            return Err("指定したタイマー位置はすでに通過しています。再観測してください。".into());
+            return Err("指定したタイマー位置はすでに通過しています。".into());
         }
         Ok(remaining)
     }
@@ -1178,6 +1316,47 @@ impl FieldState {
             .rposition(|row| row.timeline_frame <= current)
             .or(Some(0))
     }
+}
+
+/// 保存済みの全モデル状態が同じかを判定する。
+///
+/// 観測対象の未来列だけが一致する候補は、他モデルの`remain`やSFMTカーソルが異なる
+/// 可能性があるため統合しない。`TimelineCursor`が保存されていない合成テスト結果では、
+/// 開始位置まで含めた完全重複だけを統合対象とする。
+fn same_full_timeline_state(left: &FieldResult, right: &FieldResult) -> bool {
+    let Some(left_cursor) = left
+        .target_cursor
+        .as_ref()
+        .or(left.timeline_cursor.as_ref())
+    else {
+        return right.target_cursor.is_none()
+            && right.timeline_cursor.is_none()
+            && left.start_consumption == right.start_consumption;
+    };
+    let Some(right_cursor) = right
+        .target_cursor
+        .as_ref()
+        .or(right.timeline_cursor.as_ref())
+    else {
+        return false;
+    };
+    // `tick`は各候補の観測開始からの相対経過時間であり、乱数状態ではない。
+    // 開始位置が異なる候補は同じSFMTカーソルへ到達してもtickだけ異なるため、
+    // remain・モデル状態・SFMTカーソル・消費数だけを合流判定に使う。
+    left.observed_model == right.observed_model
+        && equivalent_model_status(&left_cursor.status, &right_cursor.status)
+        && left_cursor.stream_cursor == right_cursor.stream_cursor
+        && left_cursor.consumption == right_cursor.consumption
+}
+
+/// `remain=0`と`remain=1`は、どちらも次のtickでSFMTを1つ読み、
+/// `SFMT % 128 == 0`の判定へ進む。同じSFMTカーソルを持つ場合は、
+/// 未来の消費・瞬き遷移が同値になるため、合流判定では同じ待機状態とする。
+fn equivalent_model_status(left: &ModelStatus, right: &ModelStatus) -> bool {
+    left.remain.len() == right.remain.len()
+        && left.remain.iter().zip(&right.remain).all(|(left, right)| {
+            left == right || (*left == 0 && *right == 1) || (*left == 1 && *right == 0)
+        })
 }
 
 pub(super) fn parse_nonnegative(text: &str, label: &str) -> Result<i64, String> {
@@ -1377,6 +1556,221 @@ mod tests {
     }
 
     #[test]
+    fn normalize_keeps_distinct_target_sfmt_branches_separate() {
+        let make_result = |target_consumptions| FieldResult {
+            start_consumption: 500,
+            first_wait_frame: 100,
+            last_wait_frame: 200,
+            first_consumption: 600,
+            last_consumption: 700,
+            intervals: vec![100],
+            target_consumptions,
+            next_blink_wait_frame: 100,
+            target_wait_frame: None,
+            target_exact: None,
+            target_frame_before: None,
+            target_frame_after: None,
+            observed_model: 5,
+            models: 13,
+            timeline: Vec::new(),
+            target_blink_count: None,
+            timeline_cursor: None,
+            target_cursor: None,
+        };
+        let mut state = FieldState {
+            target_model: "5".into(),
+            ..FieldState::default()
+        };
+        let normalized = state.normalize_search_results(vec![
+            make_result(vec![610, 710]),
+            make_result(vec![611, 710]),
+        ]);
+        assert_eq!(normalized.len(), 2);
+    }
+
+    #[test]
+    fn normalize_keeps_candidates_with_different_internal_states() {
+        let make_result =
+            |start_consumption: i64, tick: i64, target_consumptions: Vec<i64>| FieldResult {
+                start_consumption,
+                first_wait_frame: 100,
+                last_wait_frame: 200,
+                first_consumption: target_consumptions[0],
+                last_consumption: *target_consumptions.last().unwrap(),
+                intervals: vec![100, 100],
+                target_consumptions,
+                next_blink_wait_frame: 100,
+                target_wait_frame: None,
+                target_exact: None,
+                target_frame_before: None,
+                target_frame_after: None,
+                observed_model: 10,
+                models: 13,
+                timeline: Vec::new(),
+                target_blink_count: None,
+                timeline_cursor: None,
+                target_cursor: Some(TimelineCursor {
+                    status: ModelStatus {
+                        remain: vec![1, 1, 1, 1, 1, 1, 1, 3, 1, 31, 30, 1, 1],
+                    },
+                    stream_cursor: 4_290,
+                    consumption: 4_290,
+                    tick,
+                }),
+            };
+        let mut state = FieldState {
+            target_model: "10".into(),
+            ..FieldState::default()
+        };
+        let left = make_result(482, 369, vec![1_005, 4_287, 4_939]);
+        let mut right = make_result(508, 364, vec![1_007, 4_287, 4_939]);
+        right.target_cursor.as_mut().unwrap().status.remain[1] = 2;
+        let normalized = state.normalize_search_results(vec![left, right]);
+        assert_eq!(normalized.len(), 2);
+    }
+
+    #[test]
+    fn normalize_merges_candidates_with_identical_full_state() {
+        let make_result = |start_consumption: i64, intervals, target_consumptions| FieldResult {
+            start_consumption,
+            first_wait_frame: 100,
+            last_wait_frame: 200,
+            first_consumption: 600,
+            last_consumption: 700,
+            intervals,
+            target_consumptions,
+            next_blink_wait_frame: 100,
+            target_wait_frame: None,
+            target_exact: None,
+            target_frame_before: None,
+            target_frame_after: None,
+            observed_model: 8,
+            models: 23,
+            timeline: Vec::new(),
+            target_blink_count: None,
+            timeline_cursor: None,
+            target_cursor: Some(TimelineCursor {
+                status: ModelStatus {
+                    remain: vec![1; 23],
+                },
+                stream_cursor: 800,
+                consumption: 800,
+                tick: 100,
+            }),
+        };
+        let mut state = FieldState {
+            target_model: "8".into(),
+            ..FieldState::default()
+        };
+        let left = make_result(480, vec![100, 100], vec![600, 700, 800]);
+        let mut right = make_result(491, vec![98, 102], vec![604, 696, 800]);
+        right.target_cursor.as_mut().unwrap().status.remain[5] = 0;
+        right.target_cursor.as_mut().unwrap().tick = 101;
+        let normalized = state.normalize_search_results(vec![left, right]);
+        assert_eq!(normalized.len(), 1);
+    }
+
+    #[test]
+    fn normalize_confirms_same_sfmt_series_and_uses_npc_number() {
+        let make_result = |start_consumption: i64, observed_model: usize| FieldResult {
+            start_consumption,
+            first_wait_frame: 100,
+            last_wait_frame: 200,
+            first_consumption: 600,
+            last_consumption: 700,
+            intervals: vec![100],
+            target_consumptions: vec![610, 710],
+            next_blink_wait_frame: 100,
+            target_wait_frame: None,
+            target_exact: None,
+            target_frame_before: None,
+            target_frame_after: None,
+            observed_model,
+            models: 13,
+            timeline: Vec::new(),
+            target_blink_count: None,
+            timeline_cursor: None,
+            target_cursor: None,
+        };
+        let mut state = FieldState {
+            target_model: "0".into(),
+            ..FieldState::default()
+        };
+        let normalized =
+            state.normalize_search_results(vec![make_result(480, 1), make_result(485, 0)]);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].start_consumption, 485);
+        assert_eq!(normalized[0].observed_model, 0);
+    }
+
+    #[test]
+    fn normalize_selects_the_matching_start_from_three_special_branches() {
+        let make_result = |start_consumption: i64, observed_model: usize| FieldResult {
+            start_consumption,
+            first_wait_frame: 100,
+            last_wait_frame: 300,
+            first_consumption: 1_000,
+            last_consumption: 1_200,
+            intervals: vec![100, 100],
+            target_consumptions: vec![1_000, 1_100, 1_200],
+            next_blink_wait_frame: 100,
+            target_wait_frame: None,
+            target_exact: None,
+            target_frame_before: None,
+            target_frame_after: None,
+            observed_model,
+            models: 13,
+            timeline: Vec::new(),
+            target_blink_count: None,
+            timeline_cursor: None,
+            target_cursor: None,
+        };
+        let mut state = FieldState {
+            target_model: "6".into(),
+            ..FieldState::default()
+        };
+        let normalized = state.normalize_search_results(vec![
+            make_result(480, 2),
+            make_result(482, 6),
+            make_result(490, 8),
+        ]);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].start_consumption, 482);
+        assert_eq!(normalized[0].observed_model, 6);
+    }
+
+    #[test]
+    fn normalize_marks_npc_mismatch_and_keeps_representative_start() {
+        let result = FieldResult {
+            start_consumption: 500,
+            first_wait_frame: 100,
+            last_wait_frame: 200,
+            first_consumption: 600,
+            last_consumption: 700,
+            intervals: vec![100],
+            target_consumptions: vec![610, 710],
+            next_blink_wait_frame: 100,
+            target_wait_frame: None,
+            target_exact: None,
+            target_frame_before: None,
+            target_frame_after: None,
+            observed_model: 5,
+            models: 13,
+            timeline: Vec::new(),
+            target_blink_count: None,
+            timeline_cursor: None,
+            target_cursor: None,
+        };
+        let mut state = FieldState {
+            target_model: "9".into(),
+            ..FieldState::default()
+        };
+        let normalized = state.normalize_search_results(vec![result]);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].start_consumption, 500);
+    }
+
+    #[test]
     fn timeline_table_follows_current_position_by_default() {
         assert!(FieldState::default().table_follow_current);
     }
@@ -1394,6 +1788,7 @@ mod tests {
             first_consumption: 0,
             last_consumption: 0,
             intervals: Vec::new(),
+            target_consumptions: Vec::new(),
             next_blink_wait_frame: 0,
             target_wait_frame: None,
             target_exact: None,
@@ -1424,6 +1819,15 @@ mod tests {
             ..FieldState::default()
         };
         assert_eq!(state.config().unwrap().models, 1);
+    }
+
+    #[test]
+    fn npc_number_is_required_even_for_the_player() {
+        let state = FieldState {
+            target_model: String::new(),
+            ..FieldState::default()
+        };
+        assert!(state.configs().is_err());
     }
 
     #[test]
@@ -1584,6 +1988,7 @@ mod tests {
             first_consumption: 478,
             last_consumption: 479,
             intervals: vec![2],
+            target_consumptions: Vec::new(),
             next_blink_wait_frame: 2,
             target_wait_frame: None,
             target_exact: None,
@@ -1651,6 +2056,7 @@ mod tests {
             first_consumption: 478,
             last_consumption: 479,
             intervals: vec![2],
+            target_consumptions: Vec::new(),
             next_blink_wait_frame: 2,
 
             target_wait_frame: Some(4),
@@ -1700,6 +2106,7 @@ mod tests {
             first_consumption: 478,
             last_consumption: 479,
             intervals: vec![2],
+            target_consumptions: Vec::new(),
             next_blink_wait_frame: 2,
             target_wait_frame: Some(4),
             target_exact: Some(true),
@@ -1731,6 +2138,7 @@ mod tests {
             first_consumption: 1,
             last_consumption: 2,
             intervals: vec![2],
+            target_consumptions: Vec::new(),
             next_blink_wait_frame: 2,
             target_wait_frame: Some(100),
             target_exact: Some(true),
@@ -1778,6 +2186,7 @@ mod tests {
             consumption: 0,
             status: ModelStatus::new(2),
             stream_cursor: 0,
+            model_consumption: None,
         };
         let crossing = find_target_timing(&event, 1, &values).unwrap();
         assert!(!crossing.exact);

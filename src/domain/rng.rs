@@ -166,6 +166,19 @@ pub(crate) fn generate_u64_values_from(seed: u32, start: usize, count: usize) ->
 pub struct ModelStatus {
     pub remain: Vec<i32>,
 }
+
+/// 1tick中に1つのモデルが参照したSFMT出力。
+///
+/// 通常のTimelineでは全モデルの合計カーソルだけを保持するが、観測候補を
+/// 統合するときは対象モデル自身の参照位置を識別する必要がある。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModelConsumption {
+    pub model: usize,
+    pub position: i64,
+    pub value: u64,
+    pub blink: bool,
+}
+
 impl ModelStatus {
     pub fn new(models: usize) -> Self {
         Self {
@@ -205,6 +218,54 @@ impl ModelStatus {
             used += 1;
         }
         (used, blink)
+    }
+
+    /// 状態遷移と同時に、各モデルが読んだSFMT位置を返す。
+    ///
+    /// `next`は絶対位置と値の組を返す。通常の状態遷移と同じ消費順序を
+    /// 保つため、既存の`next_state_with`とは別の追跡用経路として提供する。
+    pub(crate) fn next_state_with_positions<F>(
+        &mut self,
+        mut next: F,
+    ) -> (usize, Vec<ModelConsumption>)
+    where
+        F: FnMut() -> (i64, u64),
+    {
+        let mut used = 0;
+        let mut consumed = Vec::new();
+        for (model, remain) in self.remain.iter_mut().enumerate() {
+            if *remain > 1 {
+                *remain -= 1;
+                continue;
+            }
+            if *remain < 0 {
+                *remain += 1;
+                if *remain == 0 {
+                    let (position, value) = next();
+                    *remain = if value % 3 == 0 { 36 } else { 30 };
+                    used += 1;
+                    consumed.push(ModelConsumption {
+                        model,
+                        position,
+                        value,
+                        blink: true,
+                    });
+                }
+                continue;
+            }
+            let (position, value) = next();
+            if value & 0x7f == 0 {
+                *remain = -5;
+            }
+            used += 1;
+            consumed.push(ModelConsumption {
+                model,
+                position,
+                value,
+                blink: false,
+            });
+        }
+        (used, consumed)
     }
 
     /// 指定モデルの瞬き有無だけを返す軽量版。全モデルの状態更新と

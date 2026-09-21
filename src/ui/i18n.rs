@@ -463,6 +463,11 @@ impl Texts {
         "ロトム計算前に消費を入れる",
         "Pre-Rotom consumption"
     );
+    text_method!(
+        initial_branch_scan_span,
+        "StartingFrame検索範囲",
+        "StartingFrame search range"
+    );
     text_method!(probability, "確率", "Probability");
     text_method!(
         npc_initial_load,
@@ -473,6 +478,7 @@ impl Texts {
     text_method!(talk, "お喋り:", "Rotom chatter:");
     text_method!(talk_yes, "お喋りあり", "Chatter");
     text_method!(talk_no, "お喋りなし", "No chatter");
+    text_method!(blink_correction, "瞬き補正", "Blink correction");
     text_method!(correction, "ずれ補正", "Correction");
     text_method!(
         timeline_reachability,
