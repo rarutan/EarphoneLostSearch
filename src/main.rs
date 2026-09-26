@@ -2,6 +2,7 @@
 
 mod application;
 mod domain;
+mod errors;
 mod infrastructure;
 mod ui;
 
@@ -1054,6 +1055,7 @@ mod remain_simulation {
     /// idxずれを開始位置のずれとして表現した場合、瞬き位置の差が一時的に発生して
     /// 後で元へ戻るケースがあるかを集計する検証用テスト。
     #[test]
+    #[ignore = "10,000 Seedの探索レポートを生成する長時間シミュレーション"]
     fn summarize_blink_position_drift_and_recovery() {
         const SEED_COUNT: u32 = 10_000;
         const TICKS: usize = 1_000;
@@ -1088,9 +1090,10 @@ mod remain_simulation {
                         .unwrap_or(0);
                     max_abs_difference = max_abs_difference.max(local_max);
                     let has_nonzero = differences.iter().any(|value| *value != 0);
-                    let has_recovery = differences.iter().enumerate().any(|(index, value)| {
-                        *value != 0 && differences[index + 1..].iter().any(|later| *later == 0)
-                    });
+                    let has_recovery = differences
+                        .iter()
+                        .enumerate()
+                        .any(|(index, value)| *value != 0 && differences[index + 1..].contains(&0));
                     if has_nonzero && has_recovery {
                         recovered += 1;
                         if example_seed.is_none() {
@@ -1115,6 +1118,7 @@ mod remain_simulation {
     /// 瞬きイベントの発生tickを真偽列として比較し、短い不一致が後で
     /// 完全一致へ戻るケースを調べる検証用テスト。
     #[test]
+    #[ignore = "10,000 Seedの探索レポートを生成する長時間シミュレーション"]
     fn summarize_blink_mask_temporary_drift() {
         const SEED_COUNT: u32 = 10_000;
         const TICKS: usize = 1_000;
@@ -1209,6 +1213,7 @@ mod remain_simulation {
     /// 瞬きイベント数が同じ候補だけを対象に、位置差が1～2tick程度だけ発生して
     /// 後で0へ戻るケースを分離する検証用テスト。
     #[test]
+    #[ignore = "10,000 Seedの探索レポートを生成する長時間シミュレーション"]
     fn summarize_equal_count_small_blink_position_drift() {
         const SEED_COUNT: u32 = 10_000;
         const TICKS: usize = 2_000;
@@ -1244,7 +1249,7 @@ mod remain_simulation {
                     }
                     small_drift += 1;
                     let has_recovery = differences.iter().enumerate().any(|(index, difference)| {
-                        *difference != 0 && differences[index + 1..].iter().any(|later| *later == 0)
+                        *difference != 0 && differences[index + 1..].contains(&0)
                     });
                     if has_recovery {
                         recovery += 1;

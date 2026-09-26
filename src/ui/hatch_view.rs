@@ -4,6 +4,7 @@
 //! 検索とタイマーの計算は状態管理側で行う。
 
 use crate::application::state::AppState;
+use crate::errors::AppError;
 use crate::ui::i18n::Texts;
 use crate::ui::widgets::ColorScheme;
 use eframe::egui;
@@ -21,6 +22,27 @@ const SYMBOL_HEIGHT_RATIO: f32 = 0.65;
 const MIN_SYMBOL_SIZE: f32 = 110.0;
 const MAX_SYMBOL_SIZE: f32 = 170.0;
 
+fn next_circle_count_text(
+    guidance: Option<crate::application::state_types::HatchGuidance>,
+    target_dirty: bool,
+    guidance_searching: bool,
+) -> (String, bool) {
+    if target_dirty {
+        ("—".into(), false)
+    } else if let Some(value) = guidance.filter(|value| value.next_circle_frame.is_some()) {
+        // 現在Frameの到達判定がWorkerから届く前でも、先の○が既知ならその数を
+        // 維持する。未計算状態を優先すると、計算チャンクの境目で数字が`?`へ
+        // 一瞬切り替わり、また数字へ戻るちらつきが起きる。
+        (value.blinks_until_circle.to_string(), false)
+    } else if guidance.is_some_and(|value| value.current_reachability.is_none())
+        || guidance_searching
+    {
+        ("?".into(), true)
+    } else {
+        ("—".into(), false)
+    }
+}
+
 pub(crate) fn hatch_guidance_ui(
     ui: &mut egui::Ui,
     state: &mut AppState,
@@ -28,8 +50,8 @@ pub(crate) fn hatch_guidance_ui(
     scale: f32,
     color_scheme: ColorScheme,
     texts: &Texts,
-) {
-    let guidance = state.hatch_guidance();
+) -> Result<(), AppError> {
+    let guidance = state.hatch_guidance()?;
     let guidance_searching = state.guidance_search_pending();
     if guidance_searching {
         ui.ctx().request_repaint_after(Duration::from_millis(20));
@@ -43,25 +65,11 @@ pub(crate) fn hatch_guidance_ui(
             egui::vec2(left_width, height),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
-                let current_known =
-                    guidance.is_some_and(|value| value.current_reachability.is_some());
-                let count_label = if state.target_dirty {
-                    // Target入力中は到達判定を更新せず、判定表示を横棒で保留する。
-                    // 未確定値を`?`で表示すると入力途中に案内が変化して見えるため、
-                    // Target確定後にまとめて再計算する。
-                    "—".into()
-                } else if !current_known {
-                    "?".into()
-                } else if guidance.is_some_and(|value| value.next_circle_frame.is_some()) {
-                    guidance
-                        .map(|value| value.blinks_until_circle.to_string())
-                        .unwrap_or_else(|| "—".into())
-                } else if guidance_searching {
-                    "?".into()
-                } else {
-                    "—".into()
-                };
-                let count_color = if count_label == "?" {
+                // Target入力中は到達判定を更新せず、判定表示を横棒で保留する。
+                // 既知の次の○がある場合は、現在Frameの判定更新中も値を維持する。
+                let (count_label, count_unknown) =
+                    next_circle_count_text(guidance, state.target_dirty, guidance_searching);
+                let count_color = if count_unknown {
                     color_scheme.colors_for_ui(ui).neutral
                 } else if guidance.is_some_and(|value| value.next_circle_frame.is_some()) {
                     color_scheme.colors_for_ui(ui).timer_text
@@ -158,4 +166,57 @@ pub(crate) fn hatch_guidance_ui(
             },
         );
     });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_circle_count_text;
+    use crate::application::state_types::HatchGuidance;
+
+    fn guidance(
+        current_reachability: Option<bool>,
+        next_circle_frame: Option<i64>,
+    ) -> HatchGuidance {
+        HatchGuidance {
+            current_frame: 100,
+            current_reachability,
+            reachable_now: current_reachability == Some(true),
+            blinks_until_circle: 7,
+            next_circle_frame,
+            next_circle_seconds: None,
+            grace_seconds: None,
+            target_wait_seconds: None,
+            target_unreachable: false,
+            search_out_of_range: false,
+        }
+    }
+
+    #[test]
+    fn known_next_circle_stays_visible_while_current_result_is_pending() {
+        assert_eq!(
+            next_circle_count_text(Some(guidance(None, Some(107))), false, true),
+            ("7".into(), false)
+        );
+    }
+
+    #[test]
+    fn unknown_count_is_used_only_when_no_next_circle_is_known() {
+        assert_eq!(
+            next_circle_count_text(Some(guidance(None, None)), false, true),
+            ("?".into(), true)
+        );
+        assert_eq!(
+            next_circle_count_text(Some(guidance(Some(false), None)), false, false),
+            ("—".into(), false)
+        );
+    }
+
+    #[test]
+    fn target_edit_keeps_the_count_hidden() {
+        assert_eq!(
+            next_circle_count_text(Some(guidance(Some(false), Some(107))), true, false),
+            ("—".into(), false)
+        );
+    }
 }

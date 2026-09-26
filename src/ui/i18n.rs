@@ -87,6 +87,20 @@ impl Texts {
         }
     }
 
+    pub fn next_circle_calculating(self) -> &'static str {
+        match self.language {
+            Language::Japanese => "○まで計算中…",
+            Language::English => "Next ○: calculating...",
+        }
+    }
+
+    pub fn production_wait_calculating(self) -> &'static str {
+        match self.language {
+            Language::Japanese => "本番待機：計算中…",
+            Language::English => "Target wait: calculating...",
+        }
+    }
+
     pub fn next_calculating(self) -> String {
         match self.language {
             Language::Japanese => "next >> 計算中……".into(),
@@ -97,6 +111,7 @@ impl Texts {
     text_method!(next_blink_timer, "次の瞬きまで", "Next blink");
     text_method!(target_timer, "Targetまで", "Target timer");
     text_method!(target_passed, "通り過ぎています", "Target passed");
+    text_method!(target_calculating, "計算中…", "Calculating...");
 
     pub fn target_seconds(self, value: f64) -> String {
         match self.language {
@@ -151,89 +166,21 @@ impl Texts {
         }
     }
 
-    /// Translate status messages at the presentation boundary. Unknown domain
-    /// messages are returned unchanged until the validation layer gains
-    /// structured error codes.
-    pub fn status(self, value: &str) -> String {
+    /// Translate notices at the presentation boundary.
+    pub fn notice(self, value: &str) -> String {
         if self.language == Language::Japanese {
             return value.to_owned();
         }
         match value {
             "候補が見つかりません" => "No candidates found".into(),
-            "現在位置を一意に特定しました。追加の瞬き入力は停止しています。" => {
-                "Current position identified. Further blink input is disabled.".into()
-            }
-            "タイムラインを計算中です。観測を続けてください。" => {
-                "Building the timeline. Continue observing.".into()
-            }
-            "瞬き間隔を照合中…" => "Matching blink intervals...".into(),
-            "SFMT・Timelineを準備中…" => "Preparing SFMT and timeline...".into(),
-            "ずれ補正を計算中…" => "Calculating drift correction...".into(),
-            "ずれ補正をキャンセル中…" => "Cancelling drift correction...".into(),
-            "タイムライン仕様の計算に失敗しました。" => {
-                "Timeline calculation failed.".into()
-            }
-            "SFMTプールの計算に失敗しました。" => {
-                "SFMT pool generation failed.".into()
-            }
-            "ずれ補正に失敗しました。" => "Drift correction failed.".into(),
-            "Target Frameに到達しました。終了です。" => {
-                "Target frame reached. Done.".into()
-            }
             "本番中はオフセットを反映できません。" => {
                 "Offsets cannot be applied while the timer is running.".into()
             }
             "タイマー停止中のみ反映できます。" => {
                 "This can only be applied while the timer is stopped.".into()
             }
-            "観測をキャンセルしました。" => "Observation cancelled.".into(),
-            "検索をキャンセルしました。" => "Search cancelled.".into(),
-            "初期SEEDを入力してください。" => "Enter an initial seed.".into(),
-            "初期SEEDは8桁以内の16進数で入力してください。" => {
-                "Initial seed must be at most 8 hexadecimal digits.".into()
-            }
-            "初期SFMT SEEDは16進数で入力してください。" => {
-                "Initial SFMT seed must be hexadecimal.".into()
-            }
-            "Target Frameは整数で入力してください。" => {
-                "Target frame must be an integer.".into()
-            }
-            "実際に出現したTarget Frameは整数で入力してください。" => {
-                "Observed target frame must be an integer.".into()
-            }
-            "実際に到達したFrameは0以上で入力してください。" => {
-                "Observed frame must be zero or greater.".into()
-            }
-            "候補が一意になるまでタイマーは開始しません。" => {
-                "The timer starts after one candidate remains.".into()
-            }
-            "タイマーを開始する候補を選択してください。" => {
-                "Select a candidate before starting the timer.".into()
-            }
-            "Target消費数に到達できない候補です。" => {
-                "This candidate cannot reach the target frame.".into()
-            }
-            "TargetFrameのタイマーはまだ利用できません。" => {
-                "The target-frame timer is not available yet.".into()
-            }
-            "TargetFrameを通り過ぎています。" => "The target frame has passed.".into(),
-            "オフセットは2F単位で入力してください。" => {
-                "Offset must be entered in 2-frame increments.".into()
-            }
-            "オフセットは0以上の表示Fで入力してください。" => {
-                "Offset must be zero or greater.".into()
-            }
-            "実際の待機Frameは整数で入力してください。" => {
-                "Actual wait must be an integer.".into()
-            }
-            "実際の待機Frameは0以上で入力してください。" => {
-                "Actual wait must be zero or greater.".into()
-            }
-            "FPSは0より大きい数値で入力してください。" => {
-                "FPS must be greater than zero.".into()
-            }
-            _ if value.starts_with("候補が見つかりません") => {
-                "No candidates found".into()
+            "オフセットFrameは整数で入力してください。" => {
+                "Offset frame must be an integer.".into()
             }
             _ => value.to_owned(),
         }

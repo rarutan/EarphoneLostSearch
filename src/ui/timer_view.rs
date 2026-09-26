@@ -199,7 +199,9 @@ pub(crate) fn normal_timer_ui(
                     game_frames_to_seconds(total as f64, fps),
                     fps,
                 )),
-                Err(message) => ui.colored_label(color_scheme.colors_for_ui(ui).error, message),
+                Err(error) => {
+                    ui.colored_label(color_scheme.colors_for_ui(ui).error, error.to_string())
+                }
             };
         });
     });

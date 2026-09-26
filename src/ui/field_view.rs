@@ -1,6 +1,4 @@
-use crate::application::field::{
-    FieldIdxInference, FieldSearchOutcome, FieldSearchPool, FieldState, FieldTimerKind,
-};
+use crate::application::field::{FieldState, FieldTimerKind};
 use crate::application::state_types::SessionPhase;
 use crate::ui::i18n::Texts;
 use crate::ui::layout::{
@@ -13,7 +11,6 @@ use crate::ui::widgets::{
     offset_spinner_with_commit, wide_button, ColorScheme, COMPACT_ACTION_SIZE,
 };
 use eframe::egui;
-use std::thread::JoinHandle;
 
 const TIMER_PANEL_HEIGHT: f32 = TIMER_PANEL_HEIGHT_SHARED;
 const TIMER_SWITCH_SIZE: egui::Vec2 = egui::vec2(36.0, 36.0);
@@ -37,13 +34,24 @@ pub(crate) struct FieldUiActions {
     pub open_offset_manager: bool,
 }
 
+/// フィールド画面が表示に必要とする検索処理の状態。
+/// ワーカーハンドルやキャンセル機構は描画層へ渡さない。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FieldUiWorkerState {
+    pub search_running: bool,
+    pub pool_generation_running: bool,
+    pub idx_inference_running: bool,
+}
+
+fn field_search_is_calculating(workers: FieldUiWorkerState, target_research_pending: bool) -> bool {
+    (workers.search_running || workers.pool_generation_running) && !target_research_pending
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn field_ui(
     ui: &mut egui::Ui,
     state: &mut FieldState,
-    generation: &mut Option<JoinHandle<Result<(FieldSearchOutcome, FieldSearchPool), String>>>,
-    pool_generation: &mut Option<JoinHandle<Result<FieldSearchPool, String>>>,
-    idx_inference: &mut Option<JoinHandle<Result<FieldIdxInference, String>>>,
+    workers: FieldUiWorkerState,
     ctx: &egui::Context,
     fps: f64,
     timer_flashing: bool,
@@ -52,15 +60,13 @@ pub(crate) fn field_ui(
     texts: &Texts,
 ) -> FieldUiActions {
     state.normalize_timer_kind(fps);
-    let worker_running =
-        generation.is_some() || pool_generation.is_some() || idx_inference.is_some();
     // Targetだけの再評価では観測候補、Timeline、瞬きタイマーを保持する。フィールド全体を
     // 検索画面へ戻したりTarget欄を固定したりせず、ワーカー結果が届くまで派生Target欄だけを
     // 一時的に空とする。
-    let calculating = worker_running && !state.target_research_pending;
-    // ワーカー実行中もスピナーを動かす。完了時にも再描画を要求するが、処理中の
-    // ネイティブウィンドウが中間状態を描画できるよう一定間隔でも再描画する。
-    if worker_running {
+    // NPC番号推定は候補検索とは別の補正処理なので、検索中扱いにして確定表示を隠さない。
+    let calculating = field_search_is_calculating(workers, state.target_research_pending);
+    // ワーカーの完了状態をUIへ反映するため、計算中は定期的に再描画する。
+    if calculating {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
     let text_scale = (ui.available_width() / 1000.0).clamp(1.0, 1.6);
@@ -117,7 +123,9 @@ pub(crate) fn field_ui(
             );
             // 間隔入力中も候補検索は継続する。Timelineが一意になるまで派生する
             // タイマー表示を固定し、途中候補が案内へ混ざらないようにする。
-            let label_text = if !timeline_unique {
+            let label_text = if timeline_unique && state.target_research_pending {
+                texts.target_calculating().to_owned()
+            } else if !timeline_unique {
                 "—".to_owned()
             } else {
                 match state.timer_kind() {
@@ -177,10 +185,18 @@ pub(crate) fn field_ui(
                     egui::Layout::centered_and_justified(egui::Direction::TopDown),
                     |ui| {
                         ui.label(
-                            egui::RichText::new(texts.seconds(seconds))
-                                .size(48.0 * text_scale)
-                                .strong()
-                                .color(color_scheme.colors_for_ui(ui).timer_text),
+                            egui::RichText::new(
+                                if state.next_blink_out_of_range
+                                    && state.timer_kind() == FieldTimerKind::NextBlink
+                                {
+                                    "—".into()
+                                } else {
+                                    texts.seconds(seconds)
+                                },
+                            )
+                            .size(48.0 * text_scale)
+                            .strong()
+                            .color(color_scheme.colors_for_ui(ui).timer_text),
                         );
                     },
                 );
@@ -201,7 +217,9 @@ pub(crate) fn field_ui(
             });
             if switch_clicked {
                 if let Err(message) = state.toggle_timer_kind(fps) {
-                    state.set_actionable_status(message);
+                    if state.next_blink_out_of_range {
+                        state.set_search_range_notice(message.to_string());
+                    }
                 }
             }
             // 孵化タブと同じく、補正行は左下へ固定し、ラベルは左、
@@ -295,7 +313,7 @@ pub(crate) fn field_ui(
                 ui,
                 state,
                 calculating,
-                idx_inference.is_some(),
+                workers.idx_inference_running,
                 fps,
                 color_scheme,
                 wheel_offset_enabled,
@@ -309,6 +327,32 @@ pub(crate) fn field_ui(
         });
     });
     actions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idx_inference_does_not_hide_the_confirmed_timeline_as_a_search() {
+        let workers = FieldUiWorkerState {
+            idx_inference_running: true,
+            ..FieldUiWorkerState::default()
+        };
+
+        assert!(!field_search_is_calculating(workers, false));
+    }
+
+    #[test]
+    fn active_candidate_search_still_marks_the_view_as_calculating() {
+        let workers = FieldUiWorkerState {
+            search_running: true,
+            ..FieldUiWorkerState::default()
+        };
+
+        assert!(field_search_is_calculating(workers, false));
+        assert!(!field_search_is_calculating(workers, true));
+    }
 }
 
 fn field_timeline_ui(
@@ -443,22 +487,19 @@ fn field_timeline_ui(
                         row.duration_frames.max(0) as f64,
                         fps,
                     );
+                    let seconds_label =
+                        if state.next_blink_out_of_range && index + 1 == result.timeline.len() {
+                            "—".into()
+                        } else {
+                            format!("{seconds:.2}s")
+                        };
                     ui.add_sized(
                         [TABLE_SECONDS_COLUMN_WIDTH * scale, row_height],
-                        egui::Label::new(format!("{seconds:.2}s")),
+                        egui::Label::new(seconds_label),
                     );
                     let target_blinks = target_timeline_frame
                         .filter(|target| *target > row.timeline_frame)
-                        .map(|target| {
-                            result
-                                .timeline
-                                .iter()
-                                .filter(|future| {
-                                    future.timeline_frame > row.timeline_frame
-                                        && future.timeline_frame < target
-                                })
-                                .count()
-                        })
+                        .and_then(|_| result.target_blinks_after_row(index))
                         .map(|count| count.to_string())
                         .unwrap_or_else(|| "—".into());
                     ui.add_sized(
@@ -471,18 +512,19 @@ fn field_timeline_ui(
         ui.add_space(center_padding);
     });
     if current_timeline_frame.is_some() {
-        let fallback_sfmt = result.timeline[current_row].frame;
-        let current_sfmt = state.current_sfmt_frame(fps).unwrap_or(fallback_sfmt);
-        let current_size = egui::vec2(ui.available_width(), 24.0 * scale);
-        ui.allocate_ui_with_layout(
-            current_size,
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.add(egui::Label::new(
-                    egui::RichText::new(format!("Current >> {current_sfmt}")).size(14.0 * scale),
-                ));
-            },
-        );
+        if let Some(current_sfmt) = state.current_sfmt_frame(fps) {
+            let current_size = egui::vec2(ui.available_width(), 24.0 * scale);
+            ui.allocate_ui_with_layout(
+                current_size,
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(format!("Current >> {current_sfmt}"))
+                            .size(14.0 * scale),
+                    ));
+                },
+            );
+        }
     }
 }
 
@@ -515,11 +557,8 @@ fn field_observation_ui(
             cancelled = true;
         }
     } else if state.results.is_empty() {
-        if wide_button(ui, !calculating, texts.start_observation()) {
-            match state.configs() {
-                Ok(_) => state.start_observation(),
-                Err(message) => state.set_actionable_status(message),
-            }
+        if wide_button(ui, !calculating, texts.start_observation()) && state.configs().is_ok() {
+            state.start_observation();
         }
     } else if wide_button(ui, true, texts.reset_observation()) {
         state.cancel_observation();
@@ -587,20 +626,15 @@ fn field_observation_ui(
         state.tolerance.clone(),
     );
     if editable && before != after {
-        state.invalidate_search_results("条件を変更しました。観測結果を再計算します。");
+        state.invalidate_search_results();
         search_requested = state.intervals.len() >= crate::application::state::MIN_BLINK_INTERVALS;
     }
     let target_after = (state.target_model.clone(), state.target_mode);
     if editable && target_before != target_after {
-        state.invalidate_search_results("NPC番号を変更しました。再検索します。");
+        state.invalidate_search_results();
         search_requested = state.intervals.len() >= crate::application::state::MIN_BLINK_INTERVALS;
     }
 
-    if calculating {
-        ui.horizontal(|ui| {
-            ui.spinner();
-        });
-    }
     // 瞬き間隔と検索結果はその直下へ置く。
     let intervals_label = if state.intervals.is_empty() {
         format!("{}: —", texts.observation_intervals_frames())
@@ -629,9 +663,9 @@ fn field_observation_ui(
             .on_hover_text(intervals_label);
         },
     );
-    if state.status_is_field_notice() {
-        let status = texts.status(&state.status);
-        ui.colored_label(color_scheme.colors_for_ui(ui).error, status);
+    if let Some(message) = state.notice.as_deref() {
+        let notice = texts.notice(message);
+        ui.colored_label(color_scheme.colors_for_ui(ui).error, notice);
     }
     // 明示的な遷移ボタンは孵化タブと同じ左下枠に常設する。実行中Timelineを停止し、
     // 実測Frame／idx補正欄を解放する唯一の操作で、Enterも同じ遷移を呼び出す。
@@ -694,10 +728,11 @@ fn field_settings_ui(
     let mut idx_inference_cancel_requested = false;
     let mut open_offset_manager = false;
     ui.heading(texts.conditions());
+    let inputs_locked = calculating || idx_inference_running;
     let general_editable =
-        !calculating && !state.timer_is_running() && state.can_edit_general_settings();
+        !inputs_locked && !state.timer_is_running() && state.can_edit_general_settings();
     let correction_editable =
-        !calculating && state.can_edit_correction_inputs() && !state.timer_is_running();
+        !inputs_locked && state.can_edit_correction_inputs() && !state.timer_is_running();
     let seed_npc_editable = general_editable && state.session_phase() == SessionPhase::Input;
     let other_editable = general_editable || correction_editable;
     let before = (
@@ -734,21 +769,20 @@ fn field_settings_ui(
                         state.target_dirty = true;
                     }
                     if committed && state.target_dirty {
-                        state.target_dirty = false;
-                        if state.target_consumption.trim().is_empty() {
-                            state.clear_target_prediction(fps);
-                            state.clear_status();
-                        } else if state.results.len() == 1 {
-                            state.prepare_target_research(
-                                fps,
-                                "Targetを計算中です。瞬きタイマーは継続します。",
-                            );
-                            target_committed = true;
-                        } else {
-                            state.invalidate_search_results(
-                                "Targetを変更しました。確定後に再検索します。",
-                            );
-                            target_committed = true;
+                        match state.commit_target_input() {
+                            Err(_) => state.clear_notice(),
+                            Ok(()) if state.target_consumption.trim().is_empty() => {
+                                state.clear_target_prediction(fps);
+                                state.clear_notice();
+                            }
+                            Ok(()) if state.results.len() == 1 => {
+                                state.prepare_target_research(fps);
+                                target_committed = true;
+                            }
+                            Ok(()) => {
+                                state.invalidate_search_results();
+                                target_committed = true;
+                            }
                         }
                     }
                 });
@@ -837,6 +871,14 @@ fn field_settings_ui(
                                 ui.colored_label(color, label);
                             },
                         );
+                    } else if state.target_research_pending {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), target_row_height),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.weak(texts.target_calculating());
+                            },
+                        );
                     } else {
                         ui.allocate_space(egui::vec2(ui.available_width(), target_row_height));
                     }
@@ -899,9 +941,6 @@ fn field_settings_ui(
         ui.add_enabled_ui(correction_editable, |ui| {
             numeric_text_edit(ui, &mut state.actual_frame, 90.0, false, false);
         });
-        if idx_inference_running {
-            ui.spinner();
-        }
     });
     if correction_editable && actual_frame_before != state.actual_frame {
         state.correction_calculated = false;
@@ -916,7 +955,7 @@ fn field_settings_ui(
         state.use_offset,
     );
     if seed_npc_editable && before != after {
-        state.invalidate_search_results("条件を変更しました。観測結果を再計算します。");
+        state.invalidate_search_results();
         target_committed = state.intervals.len() >= crate::application::state::MIN_BLINK_INTERVALS;
     }
     let target_offset_changed = before.3 != after.3 || before.4 != after.4;

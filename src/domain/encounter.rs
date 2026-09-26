@@ -3,11 +3,13 @@ use super::*;
 /// 観測位置から通常の本番開始位置を求める。
 ///
 /// ロトム判定を有効にし、無言なら1消費、お喋りなら2消費として扱う。
+#[cfg(test)]
 pub fn encounter_plan(seed: u32, observed_position: i64, offset: i64) -> Option<EncounterPlan> {
     encounter_plan_with_rotom(seed, observed_position, offset, true)
 }
 
 /// 観測位置から本番開始位置を求め、ロトム判定の有無を選択する。
+#[cfg(test)]
 pub fn encounter_plan_with_rotom(
     seed: u32,
     observed_position: i64,
@@ -50,6 +52,7 @@ pub fn encounter_plan_with_observed_rotom(
 
 /// B位置でロトムを判定した後、実機のNPC初期読み込みを加えて
 /// 本番開始位置を計算する。
+#[cfg(test)]
 pub fn encounter_plan_with_observed_rotom_and_initial_load(
     seed: u32,
     observed_position: i64,
@@ -73,6 +76,7 @@ pub fn encounter_plan_with_observed_rotom_and_initial_load(
 
 /// B直後に追加消費を行ってからロトム判定とNPC初期読み込みを行う。
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn encounter_plan_with_pre_rotom_consumption(
     seed: u32,
     observed_position: i64,
@@ -96,6 +100,7 @@ pub fn encounter_plan_with_pre_rotom_consumption(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn encounter_plan_with_rotom_rule(
     seed: u32,
     observed_position: i64,
@@ -120,8 +125,39 @@ fn encounter_plan_with_rotom_rule(
     // NPC初期読み込みはロトム消費後に行うため、判定値は読み込み数に依存しない。
     let b_position = observed_position.checked_add(pre_rotom_consumption)?;
     let b_value = sfmt_value_at(seed, b_position)?;
+    encounter_plan_with_pre_rotom_value(
+        observed_position,
+        offset,
+        consider_rotom,
+        threshold,
+        observed_talk,
+        pre_rotom_consumption,
+        initial_load,
+        b_value,
+    )
+}
+
+/// キャッシュから取得したB位置のSFMT値を使ってEncounterPlanを作る。
+///
+/// 生のSFMT値はSeedと絶対位置で一意に決まるため、ロトム判定だけを
+/// 既生成キャッシュへ置き換えても通常の計算と同じ結果になる。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encounter_plan_with_pre_rotom_value(
+    observed_position: i64,
+    offset: i64,
+    consider_rotom: bool,
+    threshold: u64,
+    observed_talk: Option<bool>,
+    pre_rotom_consumption: i64,
+    initial_load: i64,
+    b_value: u64,
+) -> Option<EncounterPlan> {
+    if observed_position < 0 || initial_load < 0 || pre_rotom_consumption < 0 {
+        return None;
+    }
+    let b_position = observed_position.checked_add(pre_rotom_consumption)?;
     let rotom_consumption = if consider_rotom {
-        let predicted_talk = b_value % 100 < threshold;
+        let predicted_talk = b_value % 100 < threshold.min(100);
         let talk = observed_talk.unwrap_or(predicted_talk);
         1 + i64::from(talk)
     } else {
@@ -140,10 +176,12 @@ fn encounter_plan_with_rotom_rule(
 }
 
 /// B直後の位置のSFMT値からロトムのお喋り判定値（%100）を返す。
+#[cfg(test)]
 pub fn rotom_roll_at(seed: u32, observed_position: i64) -> Option<u8> {
     sfmt_value_at(seed, observed_position).map(|value| (value % 100) as u8)
 }
 
+#[cfg(test)]
 fn sfmt_value_at(seed: u32, position: i64) -> Option<u64> {
     if position < 0 {
         return None;

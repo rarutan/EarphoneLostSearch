@@ -1,10 +1,11 @@
+use crate::errors::{AppError, AppResult};
 use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[path = "encounter.rs"]
 #[allow(dead_code)]
@@ -12,9 +13,11 @@ mod encounter;
 pub(crate) use encounter::*;
 #[path = "observation_cache.rs"]
 mod observation_cache;
+#[cfg(test)]
+pub(crate) use observation_cache::{blink_interval_seconds, BlinkTableRow};
 pub(crate) use observation_cache::{
-    blink_interval_seconds, blink_interval_ticks, generate_observation_cache,
-    generate_observation_cache_cancelable, BlinkTableRow, ObservationCache, ObservationMatch,
+    blink_interval_ticks, generate_observation_cache, generate_observation_cache_cancelable,
+    CacheReadError, ObservationCache, ObservationMatch,
 };
 
 use crate::domain::timing::blink_ticks_to_seconds;
@@ -26,14 +29,18 @@ const N32: usize = 624;
 // 約1/30秒チェックで次に発生する。これはSFMTの消費位置とは別の軸である。
 const BLINK_INTERVAL_MODULUS: u64 = 120;
 const BLINK_INTERVAL_BASE_TICKS: u64 = 130;
-// 観測候補の末尾でも追加の瞬き列を照合できるように先読みする。
-const OBSERVATION_LOOKAHEAD: i64 = 4096;
+// 観測候補の末尾で追加の瞬き照合と本番Timeline計算に使う値を含める。
+// 最速閉じでは最大5000tick、各tickで最大256個のモデルが値を読む可能性がある。
+const OBSERVATION_LOOKAHEAD: i64 = PRODUCTION_TIMELINE_CACHE_FRAMES + 5_000 * 256 + 256;
 const OBSERVATION_CACHE_VERSION: u32 = 1;
 const OBSERVATION_CACHE_HEADER_SIZE: u64 = 24;
 
 /// 全タブで共有するSFMTキャッシュの最大Frame位置。
 /// 値は0番目から格納するため、ファイル上の要素数はこの値+1になる。
 pub const MAX_SFMT_FRAME: i64 = 50_000_000;
+/// `ModelStatus` must consume at least one SFMT value within this many empty ticks.
+/// The longest non-consuming cooldown is 35 ticks when a model has `remain == 36`.
+pub(crate) const MAX_CONSECUTIVE_IDLE_TICKS: usize = 35;
 
 /// Target値に依存せず保持できる連続本番Timelineの先読み上限。
 /// Targetは生成済み経路の検索位置にすぎないため、更新しても経路を作り直さない。
@@ -64,6 +71,33 @@ impl Sfmt {
         };
         r.certify();
         r
+    }
+
+    /// 既生成の64bit出力ブロックから、指定絶対位置の次の出力を返す状態を復元する。
+    ///
+    /// SFMTは312個の64bit出力ごとに内部状態を更新する。ブロック内の未消費出力だけを
+    /// キャッシュから取り込み、その後は通常のSFMTとして順次生成する。
+    pub(crate) fn from_cached_output_block(
+        next_position: i64,
+        block_start: i64,
+        values: &[u64],
+    ) -> Option<Self> {
+        if next_position < block_start || values.len() > N32 / 2 || values.is_empty() {
+            return None;
+        }
+        let offset = usize::try_from(next_position.checked_sub(block_start)?).ok()?;
+        if offset >= N32 / 2 || offset >= values.len() {
+            return None;
+        }
+        let mut state = [0_u32; N32];
+        for (index, value) in values.iter().copied().enumerate() {
+            state[index * 2] = value as u32;
+            state[index * 2 + 1] = (value >> 32) as u32;
+        }
+        Some(Self {
+            state,
+            index: offset * 2,
+        })
     }
     fn certify(&mut self) {
         let p = [1, 0, 0, 0x13c9e684];
@@ -141,6 +175,7 @@ impl Sfmt {
 ///
 /// 通常タイムライン検索と参照仕様検索で同じSFMT列を使うため、
 /// 各モジュールが個別に生成処理を持たないようにする。
+#[cfg(test)]
 pub(crate) fn generate_u64_values(seed: u32, count: usize) -> Vec<u64> {
     let mut sfmt = Sfmt::new(seed);
     (0..count).map(|_| sfmt.next_u64()).collect()
@@ -150,6 +185,7 @@ pub(crate) fn generate_u64_values(seed: u32, count: usize) -> Vec<u64> {
 ///
 /// 検索開始消費数より前の列を保持する必要はないため、絶対位置の大きな
 /// Targetを扱う場合も、検索窓だけをメモリへ置く。
+#[cfg(test)]
 pub(crate) fn generate_u64_values_from(seed: u32, start: usize, count: usize) -> Vec<u64> {
     let mut sfmt = Sfmt::new(seed);
     for _ in 0..start {
@@ -304,11 +340,13 @@ impl ModelStatus {
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 pub struct Timeline {
     #[allow(dead_code)]
     pub start: i64,
     #[allow(dead_code)]
     pub blink_frames: Vec<i64>,
+    #[allow(dead_code)]
     pub target_tick: Option<i64>,
 }
 
@@ -371,11 +409,36 @@ pub struct ProductionTimelineCache {
     frame_limit: i64,
     frame: i64,
     tick: i64,
-    sfmt: Sfmt,
+    values: ProductionValueSource,
     status: ModelStatus,
 }
 
+#[derive(Clone)]
+enum ProductionValueSource {
+    #[cfg(test)]
+    Generated(Box<Sfmt>),
+    Cached {
+        values: Vec<u64>,
+        cursor: usize,
+    },
+}
+
+impl ProductionValueSource {
+    fn next_u64(&mut self) -> u64 {
+        match self {
+            #[cfg(test)]
+            Self::Generated(sfmt) => sfmt.next_u64(),
+            Self::Cached { values, cursor } => {
+                let value = values[*cursor];
+                *cursor += 1;
+                value
+            }
+        }
+    }
+}
+
 impl ProductionTimelineCache {
+    #[cfg(test)]
     pub fn new(seed: u32, start: i64, models: usize, frame_limit: i64) -> Option<Self> {
         if start < 0 || models == 0 || frame_limit <= 0 {
             return None;
@@ -392,7 +455,36 @@ impl ProductionTimelineCache {
             frame_limit,
             frame: start,
             tick: 0,
-            sfmt,
+            values: ProductionValueSource::Generated(Box::new(sfmt)),
+            status: ModelStatus::new(models),
+        })
+    }
+
+    /// 観測キャッシュから開始位置以降の乱数列を受け取り、本番Timelineを作る。
+    /// 大きなFrameまでSFMTをSeedから再走査せず、キャッシュ済みの列だけを使う。
+    pub fn new_from_values(
+        seed: u32,
+        start: i64,
+        models: usize,
+        frame_limit: i64,
+        values: Vec<u64>,
+    ) -> Option<Self> {
+        if start < 0 || models == 0 || frame_limit <= 0 || values.is_empty() {
+            return None;
+        }
+        // `frame_limit`はTargetとして評価できる最大Frame差を表す。
+        // 値列は開始位置と終端位置の両方を含むため、境界値はlen - 1まで有効。
+        // 遷移が終端を越える場合も、その判定に必要な乱数値は終端位置までに収まる。
+        let available_frames = values.len().saturating_sub(1) as i64;
+        Some(Self {
+            seed,
+            start,
+            models,
+            points: Vec::new(),
+            frame_limit: frame_limit.min(available_frames),
+            frame: start,
+            tick: 0,
+            values: ProductionValueSource::Cached { values, cursor: 0 },
             status: ModelStatus::new(models),
         })
     }
@@ -414,7 +506,8 @@ impl ProductionTimelineCache {
         };
         while self.frame < end && self.tick < 10_000_000 {
             let before = self.frame;
-            let (used, _) = self.status.next_state(&mut self.sfmt);
+            let values = &mut self.values;
+            let (used, _) = self.status.next_state_with(|| values.next_u64());
             self.frame = self.frame.saturating_add(used as i64);
             self.tick = self.tick.saturating_add(1);
             self.points.push(ProductionTimelinePoint {
@@ -559,17 +652,20 @@ pub struct EncounterPlan {
 }
 
 #[allow(dead_code)]
+#[cfg(test)]
 pub fn simulate(seed: u32, start: i64, target: i64, models: usize) -> Timeline {
     let last = start.max(target).max(0) as usize;
     let values = generate_u64_stream(seed, last, models);
     simulate_with_stream(&values, 0, start, target, models)
 }
 
+#[cfg(test)]
 fn generate_u64_stream(seed: u32, last_index: usize, extra: usize) -> Vec<u64> {
     let count = last_index.saturating_add(extra).saturating_add(1);
     generate_u64_values(seed, count)
 }
 
+#[cfg(test)]
 fn simulate_with_stream(
     values: &[u64],
     values_start: i64,
@@ -612,6 +708,7 @@ fn simulate_with_stream(
     }
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 pub fn search(seed: u32, range: RangeInclusive<i64>, target: i64, models: usize) -> Vec<Timeline> {
     let last = (*range.end()).max(target).max(0) as usize;
@@ -631,6 +728,7 @@ pub fn search(seed: u32, range: RangeInclusive<i64>, target: i64, models: usize)
 /// `target` は観測列の先読み終点を決める値として参照するが、
 /// NPCによる到達判定や観測候補の除外には使わない。
 #[allow(dead_code)]
+#[cfg(test)]
 pub fn search_observation(
     seed: u32,
     range: RangeInclusive<i64>,
@@ -704,6 +802,7 @@ fn simulate_observation_with_stream(
 }
 
 /// 観測で特定した孵化演出終了時点から、本番用NPCタイムラインを計算する。
+#[cfg(test)]
 pub fn production_timeline(
     seed: u32,
     start: i64,
@@ -719,6 +818,7 @@ pub fn production_timeline(
 
 /// `start`から通常のModelStatusを`ticks`ステップ進めたSFMT位置を返す。
 /// 1ステップは1/30秒で、外部ツールの表示上は2Fに相当する。
+#[cfg(test)]
 pub fn advance_timeline(seed: u32, start: i64, models: usize, ticks: i64) -> Option<i64> {
     if start < 0 || ticks < 0 || models == 0 {
         return None;
@@ -734,6 +834,20 @@ pub fn advance_timeline(seed: u32, start: i64, models: usize, ticks: i64) -> Opt
         frame = frame.checked_add(used as i64)?;
     }
     Some(frame)
+}
+
+/// 生成済みSFMT列から、指定位置を起点にTimelineを進める。
+///
+/// 高いFrameへ移動する場合もSeedから再走査せず、呼び出し側が用意した
+/// 絶対位置付きの値列だけを読む。
+pub(crate) fn advance_timeline_from_values(
+    values: &[u64],
+    values_start: i64,
+    start: i64,
+    models: usize,
+    ticks: i64,
+) -> Option<i64> {
+    advance_timeline_with_stream(values, values_start, start, models, ticks)
 }
 
 fn advance_timeline_with_stream(
@@ -765,6 +879,7 @@ fn advance_timeline_with_stream(
 /// 連続する孵化瞬き位置の○×を、共有SFMT列から一括計算する。
 /// `fastest_ticks`がSomeなら指定ステップ後の位置がTargetと一致するか、
 /// Noneなら通常Timeline上でTargetを正確に踏むかを判定する。
+#[cfg(test)]
 pub fn target_reachability_range(
     seed: u32,
     range: RangeInclusive<i64>,
@@ -786,15 +901,40 @@ pub fn target_reachability_range(
     let span = usize::try_from(last.saturating_sub(values_start)).unwrap_or(usize::MAX);
     let count = span.saturating_add(extra).saturating_add(1);
     let values = generate_u64_values_from(seed, usize::try_from(values_start).unwrap(), count);
+    target_reachability_range_from_values(
+        &values,
+        values_start,
+        range,
+        target,
+        models,
+        fastest_ticks,
+    )
+}
+
+/// 生成済みのSFMT列から連続範囲のTarget到達可否を計算する。
+///
+/// 指定した絶対位置に対応する先読み値が既にある場合、Seedからの再走査を行わない。
+#[cfg(test)]
+pub(crate) fn target_reachability_range_from_values(
+    values: &[u64],
+    values_start: i64,
+    range: RangeInclusive<i64>,
+    target: i64,
+    models: usize,
+    fastest_ticks: Option<i64>,
+) -> Vec<(i64, bool)> {
+    if range.is_empty() || *range.start() < values_start || models == 0 {
+        return Vec::new();
+    }
     range
         .into_par_iter()
         .map(|start| {
             let reachable = match fastest_ticks {
                 Some(ticks) => {
-                    advance_timeline_with_stream(&values, values_start, start, models, ticks)
+                    advance_timeline_with_stream(values, values_start, start, models, ticks)
                         == Some(target)
                 }
-                None => simulate_with_stream(&values, values_start, start, target, models)
+                None => simulate_with_stream(values, values_start, start, target, models)
                     .target_tick
                     .is_some(),
             };
@@ -803,24 +943,82 @@ pub fn target_reachability_range(
         .collect()
 }
 
-/// 外部ツールの`CalcFrame`／通常Timelineと同じModelStatus経路でTarget時刻を探す。
-/// 正確に一致しない場合も、Targetを初めてまたぐステップを返す。
-pub fn timeline_target(
-    seed: u32,
+/// 観測キャッシュから候補開始位置だけを読み、各候補のSFMT状態を前方へ進めて到達可否を調べる。
+///
+/// Targetまでの生乱数列を一括でメモリへ展開しない。開始位置ごとに内部状態を復元し、
+/// Timelineの進行に必要な値だけを順次読むため、長距離Targetでも巨大な一時配列を作らない。
+pub(crate) fn target_reachability_range_from_cache(
+    cache: &ObservationCache,
+    range: RangeInclusive<i64>,
+    target: i64,
+    models: usize,
+    fastest_ticks: Option<i64>,
+) -> AppResult<Vec<(i64, bool)>> {
+    if range.is_empty() || models == 0 {
+        return Ok(Vec::new());
+    }
+    range
+        .into_par_iter()
+        .map(|start| {
+            let sfmt = cache.sfmt_at_checked(start).map_err(AppError::from)?;
+            let reachable = sfmt.is_some_and(|sfmt| match fastest_ticks {
+                Some(ticks) => {
+                    advance_timeline_with_sfmt(sfmt, start, models, ticks) == Some(target)
+                }
+                None => timeline_target_with_sfmt(sfmt, start, target, models)
+                    .is_some_and(|timing| timing.exact_tick.is_some()),
+            });
+            Ok((start, reachable))
+        })
+        .collect()
+}
+
+/// 観測キャッシュからTimeline開始状態だけを復元し、指定Targetまで順次進める。
+/// Targetまでの乱数列全体を一時配列へ複製しない。
+pub(crate) fn timeline_target_from_cache(
+    cache: &ObservationCache,
+    start: i64,
+    target: i64,
+    models: usize,
+) -> AppResult<Option<TimelineTarget>> {
+    Ok(cache
+        .sfmt_at_checked(start)
+        .map_err(AppError::from)?
+        .and_then(|sfmt| timeline_target_with_sfmt(sfmt, start, target, models)))
+}
+
+fn advance_timeline_with_sfmt(
+    mut sfmt: Sfmt,
+    start: i64,
+    models: usize,
+    ticks: i64,
+) -> Option<i64> {
+    if start < 0 || ticks < 0 || models == 0 {
+        return None;
+    }
+    let mut status = ModelStatus::new(models);
+    let mut frame = start;
+    for _ in 0..ticks {
+        let (used, _) = status.next_state(&mut sfmt);
+        frame = frame.checked_add(used as i64)?;
+    }
+    Some(frame)
+}
+
+fn timeline_target_with_sfmt(
+    mut sfmt: Sfmt,
     start: i64,
     target: i64,
     models: usize,
 ) -> Option<TimelineTarget> {
-    if start < 0 || target < start || models == 0 {
+    if start < 0 || target < start || target > MAX_SFMT_FRAME || models == 0 {
         return None;
-    }
-    let mut sfmt = Sfmt::new(seed);
-    for _ in 0..start {
-        sfmt.next_u64();
     }
     let mut status = ModelStatus::new(models);
     let mut frame = start;
-    for tick in 0..10_000_000_i64 {
+    let mut tick = 0_i64;
+    let mut idle_ticks = 0_usize;
+    while frame <= target {
         if frame == target {
             return Some(TimelineTarget {
                 exact_tick: Some(tick),
@@ -831,6 +1029,67 @@ pub fn timeline_target(
         }
         let before = frame;
         let (used, _) = status.next_state(&mut sfmt);
+        if used == 0 {
+            idle_ticks += 1;
+            if idle_ticks > MAX_CONSECUTIVE_IDLE_TICKS {
+                return None;
+            }
+        } else {
+            idle_ticks = 0;
+        }
+        frame = frame.checked_add(used as i64)?;
+        if before <= target && target < frame {
+            return Some(TimelineTarget {
+                exact_tick: None,
+                timeline_tick: tick + 1,
+                frame_before: before,
+                frame_after: frame,
+            });
+        }
+        tick += 1;
+    }
+    None
+}
+
+/// 外部ツールの`CalcFrame`／通常Timelineと同じModelStatus経路でTarget時刻を探す。
+/// 正確に一致しない場合も、Targetを初めてまたぐステップを返す。
+#[cfg(test)]
+pub fn timeline_target(
+    seed: u32,
+    start: i64,
+    target: i64,
+    models: usize,
+) -> Option<TimelineTarget> {
+    if start < 0 || target < start || target > MAX_SFMT_FRAME || models == 0 {
+        return None;
+    }
+    let mut sfmt = Sfmt::new(seed);
+    for _ in 0..start {
+        sfmt.next_u64();
+    }
+    let mut status = ModelStatus::new(models);
+    let mut frame = start;
+    let mut tick = 0_i64;
+    let mut idle_ticks = 0_usize;
+    while frame <= target {
+        if frame == target {
+            return Some(TimelineTarget {
+                exact_tick: Some(tick),
+                timeline_tick: tick,
+                frame_before: frame,
+                frame_after: frame,
+            });
+        }
+        let before = frame;
+        let (used, _) = status.next_state(&mut sfmt);
+        if used == 0 {
+            idle_ticks += 1;
+            if idle_ticks > MAX_CONSECUTIVE_IDLE_TICKS {
+                return None;
+            }
+        } else {
+            idle_ticks = 0;
+        }
         frame = frame.checked_add(used as i64)?;
         if before <= target && target < frame {
             return Some(TimelineTarget {
@@ -841,12 +1100,14 @@ pub fn timeline_target(
                 frame_after: frame,
             });
         }
+        tick += 1;
     }
     None
 }
 
 /// 指定したSFMT範囲を、観測後の確認用表へ変換する。
 #[allow(dead_code)]
+#[cfg(test)]
 pub fn blink_table(seed: u32, range: RangeInclusive<i64>, fps: f64) -> Vec<BlinkTableRow> {
     if *range.end() < 0 {
         return Vec::new();
@@ -884,6 +1145,26 @@ pub fn blink_table(seed: u32, range: RangeInclusive<i64>, fps: f64) -> Vec<Blink
 mod tests {
     use super::*;
     use crate::domain::timing::seconds_to_blink_ticks;
+
+    #[test]
+    fn model_status_cannot_stall_for_more_than_its_longest_cooldown() {
+        let mut status = ModelStatus { remain: vec![36] };
+        for _ in 0..MAX_CONSECUTIVE_IDLE_TICKS {
+            let (used, _) = status.next_state_with(|| 1);
+            assert_eq!(used, 0);
+        }
+        let (used, _) = status.next_state_with(|| 1);
+        assert_eq!(used, 1);
+    }
+
+    #[test]
+    #[ignore = "モデル数1で50,000,000Fまで進む長距離Target計算の回帰確認"]
+    fn field_target_reachability_supports_more_than_ten_million_ticks() {
+        let result = timeline_target_with_sfmt(Sfmt::new(0x8322_38A9), 0, MAX_SFMT_FRAME, 1);
+
+        assert!(result.is_some());
+    }
+
     #[test]
     fn sfmt_reference() {
         let mut s = Sfmt::new(1);
@@ -1016,6 +1297,76 @@ mod tests {
         assert_eq!(cache.points.len(), point_count);
         cache.extend_to(None);
         assert!(cache.points.len() > point_count);
+    }
+
+    #[test]
+    fn production_timeline_cache_from_values_matches_seeded_cache() {
+        let seed = 0x6A31_D5C2;
+        let start = 137;
+        let models = 5;
+        let frame_limit = 10_000;
+        let values =
+            generate_u64_values_from(seed, start as usize, frame_limit as usize + models + 1);
+        let mut cached =
+            ProductionTimelineCache::new_from_values(seed, start, models, frame_limit, values)
+                .unwrap();
+        let mut seeded = ProductionTimelineCache::new(seed, start, models, frame_limit).unwrap();
+        let target = advance_timeline(seed, start, models, 500).unwrap();
+
+        cached.extend_until(target);
+        seeded.extend_until(target);
+        assert_eq!(cached.points, seeded.points);
+        assert_eq!(cached.target(target), seeded.target(target));
+    }
+
+    #[test]
+    fn production_timeline_cache_can_reach_max_sfmt_frame_exactly() {
+        let seed = 1;
+        let start = MAX_SFMT_FRAME - 1_000;
+        let models = 4;
+        let values =
+            generate_u64_values_from(seed, start as usize, (MAX_SFMT_FRAME - start + 1) as usize);
+        let mut cached =
+            ProductionTimelineCache::new_from_values(seed, start, models, 100_000, values)
+                .expect("cached timeline should be available through the absolute boundary");
+
+        cached.extend_until(MAX_SFMT_FRAME);
+
+        let direct = timeline_target(seed, start, MAX_SFMT_FRAME, models).unwrap();
+        assert!(direct.exact_tick.is_some());
+        assert_eq!(
+            cached
+                .target(MAX_SFMT_FRAME)
+                .and_then(|timing| timing.exact_tick),
+            direct.exact_tick
+        );
+    }
+
+    #[test]
+    fn sfmt_reconstructed_from_cached_block_matches_seeded_stream() {
+        let seed = 0x2D6A_913B;
+        let outputs = generate_u64_values(seed, 12_000);
+        for position in [0_i64, 1, 310, 311, 312, 313, 2_047, 9_901] {
+            let block_start = position / (N32 as i64 / 2) * (N32 as i64 / 2);
+            let block_end = (block_start + N32 as i64 / 2) as usize;
+            let mut restored = Sfmt::from_cached_output_block(
+                position,
+                block_start,
+                &outputs[block_start as usize..block_end],
+            )
+            .expect("cache block restores an SFMT cursor");
+            let mut expected = Sfmt::new(seed);
+            for _ in 0..position {
+                expected.next_u64();
+            }
+            for offset in 0..1_000 {
+                assert_eq!(
+                    restored.next_u64(),
+                    expected.next_u64(),
+                    "position {position}, offset {offset}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1296,6 +1647,49 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    #[test]
+    fn cache_backed_reachability_matches_value_slice_without_reading_target_span() {
+        let seed = 0x23A4_6B91;
+        let target = 25_000;
+        let cache = generate_observation_cache(seed, 0..=32, target, 59.8621).unwrap();
+        let range = 600..=640;
+        let values = generate_u64_values_from(seed, 600, target as usize - 600 + 16);
+
+        for fastest_ticks in [None, Some(120)] {
+            let from_values = target_reachability_range_from_values(
+                &values,
+                600,
+                range.clone(),
+                target,
+                8,
+                fastest_ticks,
+            );
+            let from_cache = target_reachability_range_from_cache(
+                &cache,
+                range.clone(),
+                target,
+                8,
+                fastest_ticks,
+            )
+            .unwrap();
+            assert_eq!(from_cache, from_values);
+        }
+    }
+
+    #[test]
+    fn cache_backed_timeline_target_matches_seeded_forward_simulation() {
+        let seed = 0x31A7_6C02;
+        let start = 50_000;
+        let target = 80_000;
+        let models = 12;
+        let cache = generate_observation_cache(seed, 0..=start, target, 59.8621).unwrap();
+
+        assert_eq!(
+            timeline_target_from_cache(&cache, start, target, models).unwrap(),
+            timeline_target(seed, start, target, models)
+        );
     }
 
     #[test]

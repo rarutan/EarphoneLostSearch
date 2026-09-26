@@ -42,10 +42,3 @@ pub(crate) const DEFAULT_KEYBOARD_ENABLED: bool = true;
 pub(crate) const DEFAULT_CANDIDATE_SEARCH_SOUND: bool = true;
 pub(crate) const DEFAULT_WHEEL_OFFSET_ENABLED: bool = false;
 pub(crate) const DEFAULT_TAB: u8 = 0;
-
-pub(crate) const INITIAL_APP_STATUS: &str =
-    "初期状態です。条件を入力してタイムラインを生成してください。";
-pub(crate) const INITIAL_FIELD_STATUS: &str = "条件を入力して観測を開始してください。";
-pub(crate) const INITIAL_TIMER_STATUS: &str = "待機Frameと必要なオフセットを入力してください。";
-pub(crate) const CORRECTION_TIMER_LOCKED: &str =
-    "ずれ検証中はタイマーを再開できません。リセットしてください。";

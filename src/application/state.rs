@@ -3,25 +3,28 @@
 //! 検索・補正・本番タイマーの計算結果をセッションへ適用し、UIが描画する
 //! スナップショットを組み立てる。重い計算自体はドメイン層またはワーカーへ委譲する。
 
+use super::guidance_state::GuidanceProgress;
 use crate::application::defaults;
 use crate::application::production::ProductionQuery;
 #[cfg(test)]
 pub(crate) use crate::application::timer_state::NormalTimerSegment;
 pub(crate) use crate::application::timer_state::NormalTimerState;
-use crate::domain::reachability::reaches_exactly;
 #[cfg(test)]
-use crate::domain::rng::encounter_plan_with_observed_rotom;
-use crate::domain::rng::generate_u64_values_from;
+use crate::domain::rng::target_reachability_range;
 use crate::domain::rng::{
-    rotom_roll_at, target_reachability_range, timeline_target, EncounterPlan, ObservationCache,
-    ObservationMatch, ProductionTimeline, ProductionTimelineCache,
+    advance_timeline_from_values, target_reachability_range_from_cache, timeline_target_from_cache,
+    EncounterPlan, ObservationCache, ObservationMatch, ProductionTimeline, ProductionTimelineCache,
     PRODUCTION_TIMELINE_CACHE_FRAMES,
 };
+#[cfg(test)]
+use crate::domain::rng::{encounter_plan_with_observed_rotom, rotom_roll_at};
 use crate::domain::timing::{
     blink_ticks_to_seconds, game_frames_to_seconds, seconds_to_game_frames, DEFAULT_FPS,
 };
+use crate::errors::{AppError, ArithmeticOperation, CacheError, InputField, StateIssue};
+#[cfg(test)]
 use rayon::prelude::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub(crate) use super::state_types::*;
@@ -59,6 +62,57 @@ struct GuidanceScanPlan {
     fastest_bounds: Option<(i64, i64, bool)>,
     fastest_ticks: Option<i64>,
     target_too_far: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum CorrectionPreviewError {
+    InvalidActualFrame,
+    InvalidConfiguration,
+    CacheSeedMismatch,
+    CacheRangeUnavailable,
+    CacheAccess(AppError),
+    CalculationUnavailable,
+}
+
+impl std::fmt::Display for CorrectionPreviewError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidActualFrame => {
+                formatter.write_str("実際に出現したTarget Frameは整数で入力してください。")
+            }
+            Self::InvalidConfiguration => {
+                formatter.write_str("補正に必要な検索条件を確認してください。")
+            }
+            Self::CacheSeedMismatch => {
+                formatter.write_str("観測キャッシュが現在のSeedと一致しません。")
+            }
+            Self::CacheRangeUnavailable => {
+                formatter.write_str("補正に必要な開始位置がキャッシュ範囲外です。")
+            }
+            Self::CacheAccess(error) => {
+                write!(formatter, "SFMTキャッシュを読み込めません: {error}")
+            }
+            Self::CalculationUnavailable => {
+                formatter.write_str("現在のTimelineから補正値を計算できません。")
+            }
+        }
+    }
+}
+
+/// 選択中候補のTarget計算をUIスレッドから切り離すための入力。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProductionPreparationRequest {
+    pub(crate) session_generation: u64,
+    pub(crate) selected_candidate: usize,
+    pub(crate) observed_position: i64,
+    pub(crate) encounter_start: i64,
+    pub(crate) query: ProductionQuery,
+}
+
+/// ワーカーが準備した本番Timelineと、そのTarget判定。
+pub(crate) struct PreparedProduction {
+    cache: ProductionTimelineCache,
+    production: ProductionTimeline,
 }
 
 pub(crate) use crate::infrastructure::offset_store::{OffsetStore, SavedOffset};
@@ -102,17 +156,16 @@ pub struct AppState {
     pub normal_timer: NormalTimerState,
     /// Seed単位の共有キャッシュ。開始位置ごとのタイムラインは保持しない。
     pub observation_cache: Option<ObservationCache>,
-    /// 表に表示した行の本番到達可否。入力条件が変わると破棄する。
-    pub table_reachability: HashMap<i64, bool>,
-    /// 到達可能な行だけを順序付きで保持する。右上の次○検索を全表走査
-    /// せず、最初の到達位置を対数時間で取得するための索引。
-    guidance_reachable_frames: BTreeSet<i64>,
-    /// バックグラウンドで連続計算済みの案内範囲の終端。
-    guidance_computed_until: Option<i64>,
-    /// 観測キャッシュの先読み範囲外にある右上○区間の秒数。
-    guidance_interval_seconds: HashMap<i64, f64>,
+    /// UIスレッドの補助計算で検出したキャッシュI/O障害を、次の更新で表示する。
+    deferred_cache_io_error: std::sync::Mutex<Option<AppError>>,
+    /// 右上の到達案内が共有する結果・索引・先読み状態。
+    guidance: GuidanceProgress,
     /// 観測で特定した孵化演出終了位置から計算した本番経路。
     pub production: Option<ProductionTimeline>,
+    /// Target確定後のキャッシュ延長・本番Timeline計算中に案内へ表示する。
+    pub production_preparation_pending: bool,
+    /// 本番Timeline準備中に受け付けた移行操作。準備が完了したら実行する。
+    encounter_start_requested: bool,
     /// 確定した本番開始位置から先の連続Timeline。Targetはこのキャッシュへ
     /// 検索するだけで、Targetを変更してもTimelineを作り直さない。
     production_cache: Option<ProductionTimelineCache>,
@@ -144,11 +197,8 @@ pub struct AppState {
     correction_target_frame: Option<i64>,
     /// ずれ補正を繰り返す場合も変化させない、本番移行時点のオフセット。
     correction_source_offset: Option<i64>,
-    /// 右上案内の非同期計算を観測セッション単位で無効化する世代番号。
-    guidance_session_generation: u64,
     /// 予測音の実時間Frame補正。SFMT位置とタイムライン自体は変更しない。
     pub adjust: i64,
-    pub status: String,
 }
 
 impl Default for AppState {
@@ -181,11 +231,11 @@ impl Default for AppState {
             offset_store: OffsetStore::load(),
             normal_timer: NormalTimerState::default(),
             observation_cache: None,
-            table_reachability: HashMap::new(),
-            guidance_reachable_frames: BTreeSet::new(),
-            guidance_computed_until: None,
-            guidance_interval_seconds: HashMap::new(),
+            deferred_cache_io_error: std::sync::Mutex::new(None),
+            guidance: GuidanceProgress::default(),
             production: None,
+            production_preparation_pending: false,
+            encounter_start_requested: false,
             production_cache: None,
             candidates: Vec::new(),
             observed: Vec::new(),
@@ -207,9 +257,7 @@ impl Default for AppState {
             correction_source_index: 0,
             correction_target_frame: None,
             correction_source_offset: None,
-            guidance_session_generation: 0,
             adjust: defaults::DEFAULT_ADJUST,
-            status: defaults::INITIAL_APP_STATUS.into(),
         }
     }
 }
@@ -364,6 +412,16 @@ impl AppState {
         }
     }
 
+    /// Productionタイマーの期限を確認し、経過済みなら完了状態へ遷移する。
+    /// UIと仮想時刻テストが同じ判定を使う。
+    pub(crate) fn finish_production_if_elapsed(&mut self, now: Instant) -> bool {
+        if self.mode != Mode::Production || self.remaining_at(now) > 0.0 {
+            return false;
+        }
+        self.finish_production();
+        true
+    }
+
     /// 補正モードへ明示的に遷移する。以後はリセットまで通常タイマーへ
     /// 戻らない。ダイアログの表示や計算は呼び出し側が担当する。
     pub fn enter_correction_mode(&mut self) {
@@ -374,76 +432,48 @@ impl AppState {
     }
 
     fn clear_guidance_reachability(&mut self) {
-        self.guidance_session_generation = self.guidance_session_generation.wrapping_add(1);
-        self.table_reachability.clear();
-        self.guidance_reachable_frames.clear();
-        self.guidance_computed_until = None;
-        self.guidance_interval_seconds.clear();
+        self.guidance.invalidate();
     }
 
     fn record_guidance_reachability(&mut self, frame: i64, reachable: bool) {
-        self.table_reachability.insert(frame, reachable);
-        if reachable {
-            self.guidance_reachable_frames.insert(frame);
-        } else {
-            self.guidance_reachable_frames.remove(&frame);
-        }
+        self.guidance.record_reachability(frame, reachable);
     }
 
     /// 右上案内で使う瞬き間隔を区間単位で取得する。
     ///
-    /// 観測キャッシュの終端より先を表示する場合でも、各Frameごとに
-    /// `generate_u64_values_from`を呼ぶと同じSFMT列を何度も先頭から進める
-    /// ことになり、Target入力後の描画を止めてしまう。必要な区間を一度だけ
-    /// まとめて生成し、既存の区間キャッシュへ登録して以後の描画で再利用する。
+    /// 呼び出し元のバックグラウンド処理が要求位置までSFMTキャッシュを延長してから
+    /// 呼ぶ。描画中にキャッシュ終端を越えても、ここではSeedから再生成しない。
     fn guidance_interval_seconds_range(
         &mut self,
         cache: &ObservationCache,
-        seed: u32,
         start: i64,
         count: usize,
-    ) -> Option<Vec<f64>> {
+    ) -> Result<Option<Vec<f64>>, AppError> {
         if start < 0 {
-            return None;
+            return Ok(None);
         }
         if count == 0 {
-            return Some(Vec::new());
+            return Ok(Some(Vec::new()));
         }
-        let end = start.checked_add(count.saturating_sub(1) as i64)?;
-        let cached = (0..count)
-            .map(|offset| {
-                self.guidance_interval_seconds
-                    .get(&start.saturating_add(offset as i64))
-                    .copied()
-            })
-            .collect::<Option<Vec<_>>>();
-        if let Some(cached) = cached {
-            return Some(cached);
+        let Some(end) = start.checked_add(count.saturating_sub(1) as i64) else {
+            return Err(AppError::ArithmeticOverflow(
+                ArithmeticOperation::CacheRange,
+            ));
+        };
+        if let Some(cached) = self.guidance.cached_interval_seconds(start, count) {
+            return Ok(Some(cached));
         }
 
-        let seconds = if end <= cache.available_end() {
-            cache.interval_seconds_range(start, count).ok()?
-        } else {
-            let values = generate_u64_values_from(seed, usize::try_from(start).ok()?, count);
-            if values.len() != count {
-                return None;
-            }
-            values
-                .into_iter()
-                .map(|value| crate::domain::rng::blink_interval_seconds(value, self.fps_value()))
-                .collect()
-        };
-        for (offset, seconds) in seconds.iter().copied().enumerate() {
-            self.guidance_interval_seconds
-                .insert(start.saturating_add(offset as i64), seconds);
+        if end > cache.available_end() {
+            return Ok(None);
         }
-        Some(seconds)
+        let seconds = cache.interval_seconds_range(start, count)?;
+        self.guidance.cache_interval_seconds(start, &seconds);
+        Ok(Some(seconds))
     }
 
     fn guidance_known_end(&self, start: i64, end: i64) -> i64 {
-        self.guidance_computed_until
-            .filter(|frame| *frame >= start && *frame <= end)
-            .unwrap_or(start.saturating_sub(1))
+        self.guidance.known_end(start, end)
     }
 
     /// 右上案内の全経路で共有する検索範囲と設定スナップショットを作る。
@@ -512,55 +542,52 @@ impl AppState {
         })
     }
 
-    pub fn search_config(&self) -> Result<SearchConfig, String> {
+    pub fn search_config(&self) -> Result<SearchConfig, AppError> {
         let seed = u32::from_str_radix(self.seed.trim().trim_start_matches("0x"), 16)
-            .map_err(|_| "初期SFMT SEEDは16進数で入力してください。".to_string())?;
+            .map_err(|_| AppError::InvalidSeed)?;
         let range_start = self
             .range_start
             .trim()
             .parse::<i64>()
-            .map_err(|_| "検索範囲の始点Frameは整数で入力してください。".to_string())?;
+            .map_err(|_| AppError::InvalidInteger(InputField::SearchStart))?;
         let range_end = self
             .range_end
             .trim()
             .parse::<i64>()
-            .map_err(|_| "検索範囲の終点Frameは整数で入力してください。".to_string())?;
+            .map_err(|_| AppError::InvalidInteger(InputField::SearchEnd))?;
         let target = self
             .target
             .trim()
             .parse::<i64>()
-            .map_err(|_| "Target Frameは整数で入力してください。".to_string())?;
+            .map_err(|_| AppError::InvalidInteger(InputField::TargetFrame))?;
         if range_start < 0
             || range_end < range_start
             || target < 0
             || range_end > MAX_FRAME
             || target > MAX_FRAME
         {
-            return Err(format!(
-                "Frameは0〜{}の範囲で、検索範囲の終点は始点以上にしてください。",
-                MAX_FRAME
-            ));
+            return Err(AppError::OutOfRange {
+                field: InputField::SearchStart,
+                min: 0,
+                max: MAX_FRAME,
+            });
         }
         let npc_count = self
             .npc
             .trim()
             .parse::<usize>()
-            .map_err(|_| "NPC数は0以上の整数で入力してください。".to_string())?;
+            .map_err(|_| AppError::InvalidInteger(InputField::NpcCount))?;
         if npc_count > MAX_NPC_COUNT {
-            return Err(format!(
-                "NPC数は0～{}の範囲で入力してください。",
-                MAX_NPC_COUNT
-            ));
+            return Err(AppError::OutOfRange {
+                field: InputField::NpcCount,
+                min: 0,
+                max: MAX_NPC_COUNT as i64,
+            });
         }
         let npc_models = npc_count
             .checked_add(1)
             .filter(|models| *models <= MAX_TIMELINE_MODELS)
-            .ok_or_else(|| {
-                format!(
-                    "NPC数が大きすぎます。主人公を含むモデル数は{}以下にしてください。",
-                    MAX_TIMELINE_MODELS
-                )
-            })?;
+            .ok_or(AppError::NpcCountTooLarge)?;
         Ok(SearchConfig {
             seed,
             range_start,
@@ -587,27 +614,24 @@ impl AppState {
         }
         self.range_start = target.saturating_sub(distance).max(0).to_string();
         self.range_end = target.to_string();
-        self.status = format!(
-            "検索範囲を{}～{}Fに設定しました。",
-            self.range_start, self.range_end
-        );
     }
 
     /// 現在のオフセットから、実際の到達Frameと設定TargetFrameのTimeline差分を
     /// 補正した新しいオフセットを求める。最速閉じは差分を加算し、通常待機は
     /// B後の時間差を逆向きに補正するため減算する。
     #[cfg(test)]
-    pub fn suggested_offset_for_actual_from(&self, used_circle: i64) -> Result<i64, String> {
+    pub fn suggested_offset_for_actual_from(&self, used_circle: i64) -> Result<i64, AppError> {
         let actual = self
             .actual_target_frame
             .trim()
             .parse::<i64>()
-            .map_err(|_| "実際に出現したTarget Frameは整数で入力してください。".to_string())?;
+            .map_err(|_| AppError::InvalidInteger(InputField::ActualFrame))?;
         if !(0..=MAX_FRAME).contains(&actual) {
-            return Err(format!(
-                "実際に出現したFrameは0～{}の範囲で入力してください。",
-                MAX_FRAME
-            ));
+            return Err(AppError::OutOfRange {
+                field: InputField::ActualFrame,
+                min: 0,
+                max: MAX_FRAME,
+            });
         }
         let config = self.search_config()?;
         let delta_frames = self.timeline_drift_from_circle(&config, used_circle, actual)?;
@@ -631,7 +655,7 @@ impl AppState {
         config: &SearchConfig,
         used_circle: i64,
         actual: i64,
-    ) -> Result<i64, String> {
+    ) -> Result<i64, AppError> {
         let plan = self.correction_plan(config, used_circle)?;
         self.timeline_drift_from_plan(config, &plan, actual)
     }
@@ -640,7 +664,7 @@ impl AppState {
         &self,
         config: &SearchConfig,
         used_circle: i64,
-    ) -> Result<EncounterPlan, String> {
+    ) -> Result<EncounterPlan, AppError> {
         // 補正欄で選択した実測のお喋り有無を本番Timelineへ反映する。
         // 未選択の場合だけ、開始位置の確率判定を既定値として使う。
         let source_rotom_talk = self
@@ -654,7 +678,7 @@ impl AppState {
             self.rotom_threshold_value(),
             source_rotom_talk,
         )
-        .ok_or_else(|| "使用した○Frameから開始位置を計算できません。".to_string())
+        .ok_or(AppError::InvalidState(StateIssue::CalculationUnavailable))
     }
 
     fn timeline_drift_from_plan(
@@ -662,39 +686,65 @@ impl AppState {
         config: &SearchConfig,
         plan: &EncounterPlan,
         actual: i64,
-    ) -> Result<i64, String> {
+    ) -> Result<i64, AppError> {
         let target_frame = self.correction_target_frame.unwrap_or(config.target);
         // B+ロトムから続く同一Timeline上で両方のFrameを比較する。最速閉じオフセットを
         // 先に進めてModelStatusを再初期化すると`remain`を失い、オフセット前の実測Frameを
         // 照会できなくなるため、その経路は使わない。
         let start = plan.encounter_start;
-        let target_timing = timeline_target(config.seed, start, target_frame, config.npc_models)
-            .ok_or_else(|| "TargetFrameのTimelineを計算できません。".to_string())?;
-        let actual_timing = timeline_target(config.seed, start, actual, config.npc_models)
-            .ok_or_else(|| "実出現FrameのTimelineを計算できません。".to_string())?;
+        let target_timing = self
+            .timeline_target_from_cache(config.seed, start, target_frame, config.npc_models)?
+            .ok_or(AppError::InvalidState(StateIssue::CalculationUnavailable))?;
+        let actual_timing = self
+            .timeline_target_from_cache(config.seed, start, actual, config.npc_models)?
+            .ok_or(AppError::InvalidState(StateIssue::CalculationUnavailable))?;
         let delta_frames = actual_timing
             .timeline_tick
             .checked_sub(target_timing.timeline_tick)
             .and_then(|value| value.checked_mul(2))
-            .ok_or_else(|| "計算した補正が大きすぎます。".to_string())?;
+            .ok_or(AppError::ArithmeticOverflow(
+                ArithmeticOperation::OffsetCalculation,
+            ))?;
         Ok(delta_frames)
     }
 
     /// ずれ補正の確認ダイアログに表示する計算結果を作る。
-    pub fn correction_preview_from(&self, used_circle: i64) -> Result<CorrectionPreview, String> {
+    pub fn correction_preview_from(
+        &self,
+        used_circle: i64,
+    ) -> Result<CorrectionPreview, CorrectionPreviewError> {
         self.correction_preview(used_circle)
     }
 
-    fn correction_preview(&self, used_circle: i64) -> Result<CorrectionPreview, String> {
+    fn correction_preview(
+        &self,
+        used_circle: i64,
+    ) -> Result<CorrectionPreview, CorrectionPreviewError> {
         let actual = self
             .actual_target_frame
             .trim()
             .parse::<i64>()
-            .map_err(|_| "実際に出現したTarget Frameは整数で入力してください。".to_string())?;
-        let config = self.search_config()?;
+            .map_err(|_| CorrectionPreviewError::InvalidActualFrame)?;
+        let config = self
+            .search_config()
+            .map_err(|_| CorrectionPreviewError::InvalidConfiguration)?;
         let current_offset = self.correction_source_offset_value();
-        let plan = self.correction_plan(&config, used_circle)?;
-        let drift = self.timeline_drift_from_plan(&config, &plan, actual)?;
+        let rotom_position = used_circle
+            .checked_add(self.pre_rotom_consumption_value())
+            .ok_or(CorrectionPreviewError::CalculationUnavailable)?;
+        self.ensure_correction_cache_readable(config.seed, rotom_position)?;
+        let plan = self
+            .correction_plan(&config, used_circle)
+            .map_err(|_| CorrectionPreviewError::CalculationUnavailable)?;
+        self.ensure_correction_cache_readable(config.seed, plan.encounter_start)?;
+        let drift = self
+            .timeline_drift_from_plan(&config, &plan, actual)
+            .map_err(|error| match error {
+                error @ AppError::Cache(CacheError::Io { .. }) => {
+                    CorrectionPreviewError::CacheAccess(error)
+                }
+                _ => CorrectionPreviewError::CalculationUnavailable,
+            })?;
         let suggested_offset = if self.fastest_close {
             current_offset.saturating_add(drift)
         } else {
@@ -709,10 +759,19 @@ impl AppState {
         // 経過時間・補正値として別に扱い、ロトムとNPC初期読み込みだけを起点へ反映する。
         let timeline_start = plan.encounter_start;
         let target_frame = self.correction_target_frame.unwrap_or(config.target);
-        let target_on_timeline =
-            reaches_exactly(config.seed, timeline_start, target_frame, config.npc_models);
-        let actual_on_timeline =
-            reaches_exactly(config.seed, timeline_start, actual, config.npc_models);
+        let target_on_timeline = self
+            .timeline_target_from_cache(
+                config.seed,
+                timeline_start,
+                target_frame,
+                config.npc_models,
+            )
+            .map_err(CorrectionPreviewError::CacheAccess)?
+            .is_some_and(|timing| timing.exact_tick.is_some());
+        let actual_on_timeline = self
+            .timeline_target_from_cache(config.seed, timeline_start, actual, config.npc_models)
+            .map_err(CorrectionPreviewError::CacheAccess)?
+            .is_some_and(|timing| timing.exact_tick.is_some());
         Ok(CorrectionPreview {
             suggested_offset,
             timeline_start,
@@ -722,6 +781,26 @@ impl AppState {
             target_frame,
             rotom_correction,
         })
+    }
+
+    fn ensure_correction_cache_readable(
+        &self,
+        seed: u32,
+        position: i64,
+    ) -> Result<(), CorrectionPreviewError> {
+        let Some(cache) = self
+            .observation_cache
+            .as_ref()
+            .filter(|cache| cache.seed == seed)
+        else {
+            return Err(CorrectionPreviewError::CacheSeedMismatch);
+        };
+        if !(0..=cache.available_end()).contains(&position) {
+            return Err(CorrectionPreviewError::CacheRangeUnavailable);
+        }
+        cache
+            .verify_readable(position)
+            .map_err(|error| CorrectionPreviewError::CacheAccess(AppError::from(error)))
     }
 
     pub fn correction_start_candidates(&self) -> Vec<i64> {
@@ -801,7 +880,7 @@ impl AppState {
     pub fn predicted_rotom_talk_for_correction_source(&self) -> Option<bool> {
         let source = self.selected_correction_start()?;
         let config = self.search_config().ok()?;
-        rotom_roll_at(
+        self.cached_rotom_roll_at(
             config.seed,
             source.saturating_add(self.pre_rotom_consumption_value()),
         )
@@ -840,6 +919,8 @@ impl AppState {
 
     pub fn apply_observation_cache(&mut self, cache: ObservationCache) {
         self.target_dirty = false;
+        self.production_preparation_pending = false;
+        self.encounter_start_requested = false;
         self.observation_cache = Some(cache);
         self.clear_guidance_reachability();
         self.production = None;
@@ -856,18 +937,13 @@ impl AppState {
         self.correction_target_frame = None;
         self.correction_source_offset = None;
         self.clear_article_timer();
-        self.status = format!(
-            "{}F分の共有SFMTキャッシュを準備しました。観測結果を照合します。",
-            self.observation_cache
-                .as_ref()
-                .map(ObservationCache::len)
-                .unwrap_or(0)
-        );
     }
 
     /// 計算中でも観測を先に開始できる入口。計算完了後に観測列を照合する。
     pub fn start_observation_pending(&mut self) {
         self.target_dirty = false;
+        self.production_preparation_pending = false;
+        self.encounter_start_requested = false;
         self.observation_cache = None;
         self.clear_guidance_reachability();
         self.production = None;
@@ -888,11 +964,13 @@ impl AppState {
         self.correction_target_frame = None;
         self.correction_source_offset = None;
         self.clear_article_timer();
-        self.status = "観測中：最初の瞬きは基準として記録します。計算完了後に照合します。".into();
     }
 
     pub fn cancel_observation(&mut self) {
         self.target_dirty = false;
+        self.production_preparation_pending = false;
+        self.encounter_start_requested = false;
+        self.observation_cache = None;
         self.enter_idle();
         self.clear_guidance_reachability();
         self.production = None;
@@ -914,41 +992,31 @@ impl AppState {
         self.correction_target_frame = None;
         self.correction_source_offset = None;
         self.clear_article_timer();
-        self.status = "瞬き観測をキャンセルしました。".into();
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn generate(&mut self) {
         let Ok(seed) = u32::from_str_radix(self.seed.trim().trim_start_matches("0x"), 16) else {
-            self.status = "初期SFMT SEEDは16進数で入力してください。".into();
             return;
         };
         let Ok(a) = self.range_start.trim().parse::<i64>() else {
-            self.status = "検索範囲の始点Frameは整数で入力してください。".into();
             return;
         };
         let Ok(b) = self.range_end.trim().parse::<i64>() else {
-            self.status = "検索範囲の終点Frameは整数で入力してください。".into();
             return;
         };
         let Ok(target) = self.target.trim().parse::<i64>() else {
-            self.status = "Target Frameは整数で入力してください。".into();
             return;
         };
         if a < 0 || b < a || target < 0 || b > MAX_FRAME || target > MAX_FRAME {
-            self.status = format!(
-                "Frameは0〜{}の範囲で、検索範囲の終点は始点以上にしてください。",
-                MAX_FRAME
-            );
             return;
         }
         // 観測段階はNPCなし。NPC数は孵化演出終了後の本番計算でだけ使う。
         match crate::domain::rng::generate_observation_cache(seed, a..=b, target, self.fps_value())
         {
             Ok(cache) => self.observation_cache = Some(cache),
-            Err(message) => {
-                self.status = message;
+            Err(_) => {
                 return;
             }
         }
@@ -967,14 +1035,12 @@ impl AppState {
         self.correction_source_index = 0;
         self.correction_target_frame = None;
         self.correction_source_offset = None;
-        self.status = "SFMTキャッシュを生成しました。観測開始を押してください。".into();
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn start_observation(&mut self) {
         if self.observation_cache.is_none() {
-            self.status = "先にSFMTキャッシュを生成してください。".into();
             return;
         }
         self.enter_observing();
@@ -993,8 +1059,6 @@ impl AppState {
         self.correction_source_index = 0;
         self.correction_target_frame = None;
         self.correction_source_offset = None;
-        self.status =
-            "観測中：最初の瞬きは基準として記録します。次の瞬きから間隔を判定します。".into();
     }
 
     pub fn observe(&mut self) {
@@ -1002,7 +1066,6 @@ impl AppState {
             return;
         }
         if self.observed.len() >= MAX_BLINK_OBSERVATIONS {
-            self.status = format!("瞬き観測は{}回までです。", MAX_BLINK_OBSERVATIONS);
             return;
         }
         let now = Instant::now();
@@ -1021,41 +1084,28 @@ impl AppState {
 
         // 最初のSpaceは基準点のみ。最初の瞬きまでの待ち時間は検索に含めない。
         if self.intervals.is_empty() {
-            self.status = "基準の瞬きを記録しました。次の瞬きから間隔を入力します。".into();
             return;
         }
         if self.intervals.len() < MIN_BLINK_INTERVALS {
             self.candidates.clear();
             self.search_exhausted = false;
-            self.status = "→ 観測をさらに待つ".into();
             return;
         }
         if self.observation_cache.is_none() {
             self.candidates.clear();
             self.search_exhausted = false;
-            self.status = "→ タイムライン計算の完了を待つ".into();
             return;
         }
 
-        let tolerance = self.rematch_candidates();
+        self.rematch_candidates();
         self.selected = 0;
         self.refresh_production();
         match self.candidates.len() {
-            0 => {
-                self.status = format!("候補が見つかりません（自動許容範囲 ±{}時間F）。設定または瞬き入力が間違っている可能性があります。観測をキャンセルしてください。", tolerance);
-            }
+            0 => {}
             1 => {
                 self.enter_ready();
-                self.status =
-                    "タイムラインを特定しました。Enterまたは本番移行ボタンでタイマーを開始します。"
-                        .into();
             }
-            count => {
-                self.status = format!(
-                    "候補{}件（許容範囲 ±{}時間F）。さらに瞬きを入力して絞り込んでください。",
-                    count, tolerance
-                );
-            }
+            _ => {}
         }
         self.schedule_blink();
     }
@@ -1068,34 +1118,23 @@ impl AppState {
         if self.intervals.len() < MIN_BLINK_INTERVALS {
             self.candidates.clear();
             self.search_exhausted = false;
-            self.status = "→ 観測をさらに待つ".into();
             return;
         }
         if self.observation_cache.is_none() {
             self.candidates.clear();
             self.search_exhausted = false;
-            self.status = "→ タイムライン計算の完了を待つ".into();
             return;
         }
-        let tolerance = self.rematch_candidates();
+        self.rematch_candidates();
         self.selected = 0;
         self.refresh_production();
         if self.candidates.len() == 1 {
             self.enter_ready();
-            self.status =
-                "タイムラインを特定しました。Enterまたは本番移行ボタンでタイマーを開始します。"
-                    .into();
-        } else {
-            self.status = format!(
-                "計算完了。候補{}件（許容範囲 ±{}時間F）です。さらに瞬きを入力してください。",
-                self.candidates.len(),
-                tolerance
-            );
         }
         self.schedule_blink();
     }
 
-    fn rematch_candidates(&mut self) -> i64 {
+    fn rematch_candidates(&mut self) {
         let mut tolerance = self
             .match_tolerance
             .max(self.tolerance_value())
@@ -1109,17 +1148,23 @@ impl AppState {
                     .collect();
                 self.match_tolerance = tolerance;
                 self.search_exhausted = self.candidates.is_empty();
-                return tolerance;
+                return;
             }
             tolerance += 1;
         }
     }
 
     fn find_matches(&self, tolerance: i64) -> Vec<ObservationMatch> {
-        self.observation_cache
-            .as_ref()
-            .and_then(|cache| cache.find_matches(&self.intervals, tolerance).ok())
-            .unwrap_or_default()
+        let Some(cache) = self.observation_cache.as_ref() else {
+            return Vec::new();
+        };
+        match cache.find_matches(&self.intervals, tolerance) {
+            Ok(matches) => matches,
+            Err(error) => {
+                self.defer_cache_io_error(error);
+                Vec::new()
+            }
+        }
     }
 
     fn schedule_blink(&mut self) {
@@ -1143,11 +1188,19 @@ impl AppState {
         self.schedule_blink_from(first + observed_elapsed);
     }
 
-    fn next_blink_seconds_at(&self, position: i64, fallback_ticks: i64) -> f64 {
-        self.observation_cache
+    fn next_blink_seconds_at(&self, position: i64, fallback_ticks: i64) -> Option<f64> {
+        match self
+            .observation_cache
             .as_ref()
-            .and_then(|cache| cache.interval_seconds_at(position).ok().flatten())
-            .unwrap_or_else(|| blink_ticks_to_seconds(fallback_ticks, self.fps_value()))
+            .map(|cache| cache.interval_seconds_at(position))
+        {
+            Some(Ok(Some(seconds))) => Some(seconds),
+            Some(Err(error)) if error.is_cache_io() => {
+                self.defer_cache_io_error(error);
+                None
+            }
+            _ => Some(blink_ticks_to_seconds(fallback_ticks, self.fps_value())),
+        }
     }
 
     fn schedule_blink_from(&mut self, anchor: Instant) {
@@ -1159,7 +1212,13 @@ impl AppState {
             self.next_blink = None;
             return;
         };
-        let interval_seconds = self.next_blink_seconds_at(candidate.sfmt_position, interval_ticks);
+        let Some(interval_seconds) =
+            self.next_blink_seconds_at(candidate.sfmt_position, interval_ticks)
+        else {
+            self.next_blink = None;
+            self.next_blink_index = None;
+            return;
+        };
         let deadline = anchor + Duration::from_secs_f64(interval_seconds);
         self.next_blink = Some(self.shift_deadline_by_adjust(deadline));
         self.next_blink_index = Some(candidate.sfmt_position);
@@ -1197,32 +1256,34 @@ impl AppState {
         // `current_index`の乱数値は、いま鳴らした瞬きまでの区間ですでに使用済み。
         // 次回は必ず1つ進めた位置の乱数値を使う。
         let next_index = current_index.saturating_add(1);
-        let Some(interval_ticks) = self
+        let interval_ticks = match self
             .observation_cache
             .as_ref()
-            .and_then(|cache| cache.interval_ticks_at(next_index).ok().flatten())
-        else {
+            .map(|cache| cache.interval_ticks_at(next_index))
+        {
+            Some(Ok(Some(ticks))) => ticks,
+            Some(Err(error)) if error.is_cache_io() => {
+                self.defer_cache_io_error(error);
+                self.next_blink = None;
+                self.next_blink_index = None;
+                return;
+            }
+            _ => {
+                self.next_blink = None;
+                self.next_blink_index = None;
+                return;
+            }
+        };
+        let Some(interval_seconds) = self.next_blink_seconds_at(next_index, interval_ticks) else {
             self.next_blink = None;
             self.next_blink_index = None;
             return;
         };
-        let interval_seconds = self.next_blink_seconds_at(next_index, interval_ticks);
         self.next_blink = Some(previous_deadline + Duration::from_secs_f64(interval_seconds));
         self.next_blink_index = Some(next_index);
-        // 予測瞬きで現在位置が進んだら、本番の到達可否も同じ位置で更新する。
-        // ここを更新しないと、表の青バーだけ進み、左側には古い位置の
-        // 「到達不可」が残ってしまう。
-        self.refresh_production();
-        if self.mode == Mode::Ready {
-            self.status = if self
-                .production
-                .is_some_and(|production| production.target_tick.is_some())
-            {
-                "現在の位置からTarget Frameに到達できます。Readyを押してください。".into()
-            } else {
-                "現在の位置ではTarget Frameに到達できません。次の瞬きを待って、表の○を確認してください。".into()
-            };
-        }
+        // 現在位置が進んだ場合も本番Timelineは更新するが、絶対Frameごとの
+        // 到達判定結果は変わらないため、次の○の先読みを消さずに保持する。
+        self.refresh_production_preserving_guidance();
     }
 
     /// 現在選択中の候補について、次に消費されるSFMT位置を返す。
@@ -1264,31 +1325,48 @@ impl AppState {
         if !self.can_start_timer() {
             return;
         }
-        if let Some(message) = self.encounter_offset_error() {
-            self.status = message;
+        if self.encounter_offset_error().is_some() {
             return;
         }
         if self.candidates.get(self.selected).is_none() {
-            self.status = "タイムラインが未確定です。".into();
+            return;
+        }
+        let Some(config) = self.search_config().ok() else {
+            return;
+        };
+        if config
+            .target
+            .saturating_sub(self.selected_candidate_position().unwrap_or(config.target))
+            > MAX_PRODUCTION_LOOKAHEAD
+        {
+            return;
+        }
+        let cache_matches_seed = self
+            .observation_cache
+            .as_ref()
+            .is_some_and(|cache| cache.seed == config.seed);
+        if !cache_matches_seed {
             return;
         }
         self.initialize_observed_rotom_talk();
-        let Some(production) = self.production_for_selected() else {
-            self.status = "本番タイムラインを計算できません。設定を確認してください。".into();
+        if self.production_preparation_pending {
+            self.encounter_start_requested = true;
+            return;
+        }
+        let Some(production) = self.production else {
+            self.mark_production_preparation_pending();
+            self.encounter_start_requested = true;
             return;
         };
         if production.target_tick.is_none() {
-            self.status =
-                "現在の位置ではTarget Frameに到達できません。次の瞬きを待って、表の○を確認してください。"
-                    .into();
             return;
         }
-        let Some(plan) = self.article_plan_for_selected() else {
-            self.status = "ロトム補正を計算できません。設定を確認してください。".into();
+        let Some(_plan) = self.article_plan_for_selected() else {
             return;
         };
 
         self.production = Some(production);
+        self.encounter_start_requested = false;
         // 補正はSet後の表示値ではなく、本番へ移行した時点の値を基準にする。
         self.correction_source_offset = Some(self.encounter_offset_value());
         // Readyを押した時点から区間を最初から数え直さず、Shift観測と補正から
@@ -1296,9 +1374,6 @@ impl AppState {
         if self.fastest_close {
             // 最速閉じは○までの案内だけで完了する。○表示後にアプリ側で
             // Enterを受けたりTargetタイマーを開始したりしない。
-            self.status =
-                "最速閉じでは○の間に実機でBを押してください。アプリ側のEnter操作は不要です。"
-                    .into();
             return;
         }
 
@@ -1321,10 +1396,6 @@ impl AppState {
             self.article_next_seconds = None;
             self.start_article_timer(ArticleTimerStage::ToTarget, target_seconds);
         }
-        self.status = format!(
-            "追加待機タイマー開始：オフセット{}F → 開始Frame {}（ロトム消費+{}）→ Target。",
-            plan.offset, plan.encounter_start, plan.rotom_consumption
-        );
     }
 
     /// 最速閉じの○を実際に使用した時点で、瞬き予測を停止して
@@ -1356,25 +1427,41 @@ impl AppState {
         self.timer_start = None;
         self.clear_article_timer();
         self.enter_finished();
-        self.status.clear();
         true
     }
 
     pub fn remaining(&self) -> f64 {
+        self.remaining_at(Instant::now())
+    }
+
+    fn remaining_at(&self, now: Instant) -> f64 {
         self.timer_start
-            .map(|start| (self.timer_seconds - start.elapsed().as_secs_f64()).max(0.0))
+            .map(|start| {
+                (self.timer_seconds - now.saturating_duration_since(start).as_secs_f64()).max(0.0)
+            })
             .unwrap_or(0.0)
     }
 
     pub fn article_remaining(&self) -> f64 {
+        self.article_remaining_at(Instant::now())
+    }
+
+    fn article_remaining_at(&self, now: Instant) -> f64 {
         self.article_timer_start
-            .map(|start| (self.article_timer_seconds - start.elapsed().as_secs_f64()).max(0.0))
+            .map(|start| {
+                (self.article_timer_seconds - now.saturating_duration_since(start).as_secs_f64())
+                    .max(0.0)
+            })
             .unwrap_or(0.0)
     }
 
     /// 記事方式のカウントダウンを進め、段階が切り替わったときにその段階を返す。
     pub fn tick_article_timer(&mut self) -> Option<ArticleTimerStage> {
-        if self.mode != Mode::Countdown || self.article_remaining() > 0.0 {
+        self.tick_article_timer_at(Instant::now())
+    }
+
+    fn tick_article_timer_at(&mut self, now: Instant) -> Option<ArticleTimerStage> {
+        if self.mode != Mode::Countdown || self.article_remaining_at(now) > 0.0 {
             return None;
         }
         let stage = self.article_timer_stage?;
@@ -1384,16 +1471,14 @@ impl AppState {
                 let next_start = self
                     .article_timer_start
                     .map(|start| start + Duration::from_secs_f64(self.article_timer_seconds))
-                    .unwrap_or_else(Instant::now);
+                    .unwrap_or(now);
                 self.article_timer_stage = Some(ArticleTimerStage::ToTarget);
                 self.article_timer_seconds = target_seconds;
                 self.article_timer_start = Some(next_start);
-                self.status = "オフセット終了。本番のTarget待機を開始しました。".into();
             }
             ArticleTimerStage::ToTarget => {
                 self.enter_finished();
                 self.clear_article_timer();
-                self.status = "Target Frame到達時刻です。エンカウントを確認してください。".into();
             }
         }
         Some(stage)
@@ -1447,7 +1532,7 @@ impl AppState {
     /// 現在選択中の閉じた位置に対応する、閾値判定上のお喋り予測。
     pub fn predicted_rotom_talk(&self) -> Option<bool> {
         let position = self.selected_candidate_position()?;
-        rotom_roll_at(
+        self.cached_rotom_roll_at(
             self.search_config().ok()?.seed,
             position.saturating_add(self.pre_rotom_consumption_value()),
         )
@@ -1475,7 +1560,7 @@ impl AppState {
             return None;
         }
         let config = self.search_config().ok()?;
-        let roll = rotom_roll_at(
+        let roll = self.cached_rotom_roll_at(
             config.seed,
             used_circle.saturating_add(self.pre_rotom_consumption_value()),
         )?;
@@ -1534,15 +1619,28 @@ impl AppState {
         threshold: u64,
         observed_talk: Option<bool>,
     ) -> Option<EncounterPlan> {
-        crate::domain::rng::encounter_plan_with_pre_rotom_consumption(
-            seed,
+        let pre_rotom = self.pre_rotom_consumption_value();
+        let b_position = observed_position.checked_add(pre_rotom)?;
+        let cache = self
+            .observation_cache
+            .as_ref()
+            .filter(|cache| cache.seed == seed)?;
+        let b_value = match cache.read_values(b_position, 1) {
+            Ok(values) => values.first().copied()?,
+            Err(error) => {
+                self.defer_cache_io_error(error);
+                return None;
+            }
+        };
+        crate::domain::rng::encounter_plan_with_pre_rotom_value(
             observed_position,
             offset,
             consider_rotom,
             threshold,
             observed_talk,
-            self.pre_rotom_consumption_value(),
+            pre_rotom,
             self.npc_initial_load_value(),
+            b_value,
         )
     }
 
@@ -1561,7 +1659,7 @@ impl AppState {
         (frames >= 0 && frames % 2 == 0).then_some(frames / 2)
     }
 
-    pub fn encounter_offset_error(&self) -> Option<String> {
+    pub fn encounter_offset_error(&self) -> Option<AppError> {
         if !self.use_offset {
             return None;
         }
@@ -1571,19 +1669,20 @@ impl AppState {
         } else if let Ok(frames) = trimmed.parse::<i64>() {
             frames
         } else {
-            return Some("オフセットは整数の表示Fで入力してください。".into());
+            return Some(AppError::InvalidInteger(InputField::Offset));
         };
         if frames < 0 {
-            return Some("オフセットは0以上の表示Fで入力してください。".into());
+            return Some(AppError::NegativeValue(InputField::Offset));
         }
         if frames > MAX_ENCOUNTER_OFFSET_FRAMES {
-            return Some(format!(
-                "オフセットは{}F以下で入力してください。",
-                MAX_ENCOUNTER_OFFSET_FRAMES
-            ));
+            return Some(AppError::OutOfRange {
+                field: InputField::Offset,
+                min: 0,
+                max: MAX_ENCOUNTER_OFFSET_FRAMES,
+            });
         }
         if frames % 2 != 0 {
-            return Some("オフセットは2F単位で入力してください。".into());
+            return Some(AppError::OffsetMustBeEven);
         }
         None
     }
@@ -1630,12 +1729,21 @@ impl AppState {
         )
     }
 
-    fn production_for_selected(&mut self) -> Option<ProductionTimeline> {
+    /// Target確定後に必要なSFMT範囲を計算し、本番Timelineを準備する要求を作る。
+    pub(crate) fn production_preparation_request(
+        &self,
+    ) -> Option<(ProductionPreparationRequest, ObservationCache)> {
+        if self.target_dirty
+            || self.encounter_offset_error().is_some()
+            || self.candidates.get(self.selected).is_none()
+        {
+            return None;
+        }
         let config = self.search_config().ok()?;
-        let current = self.selected_candidate_position()?;
-        // 孵化の案内・本番計算は表示中の現在位置からの距離で上限を設ける。背景候補検索と
-        // 同じ境界を使い、極端に遠いTargetで数百万Frameの同期計算を発生させない。
-        if config.target.saturating_sub(current) > MAX_PRODUCTION_LOOKAHEAD {
+        let observed_position = self.selected_candidate_position()?;
+        if config.target < observed_position
+            || config.target.saturating_sub(observed_position) > MAX_PRODUCTION_LOOKAHEAD
+        {
             return None;
         }
         let query = ProductionQuery {
@@ -1653,57 +1761,192 @@ impl AppState {
                 .then(|| self.encounter_offset_ticks())
                 .flatten(),
         };
-        let start = query.encounter_start(current)?;
-
-        let cache_matches = self.production_cache.as_ref().is_some_and(|cache| {
-            cache.seed == config.seed
-                && cache.models == config.npc_models
-                && cache.target_from(start, start).is_some()
-        });
-        if !cache_matches {
-            self.production_cache = ProductionTimelineCache::new(
-                config.seed,
-                start,
-                config.npc_models,
-                PRODUCTION_TIMELINE_CACHE_FRAMES,
-            );
+        if self.fastest_close && query.fastest_ticks.is_none() {
+            return None;
         }
-        let cache = self.production_cache.as_mut()?;
-        // Targetは固定経路上の検索位置にすぎない。有限チャンクで遅延延長し、
-        // 後からTargetを更新しても同じ状態から検索を続ける。
-        cache.extend_until(config.target);
-        let target = cache
-            .target_from(start, config.target)
-            .or_else(|| timeline_target(config.seed, start, config.target, config.npc_models))?;
-        Some(ProductionTimeline {
-            target: config.target,
-            target_tick: target.exact_tick,
+        let plan = self.plan_for_encounter(
+            config.seed,
+            observed_position,
+            query.offset,
+            query.consider_rotom,
+            query.rotom_threshold,
+            query.observed_rotom_talk,
+        )?;
+        let cache = self
+            .observation_cache
+            .as_ref()
+            .filter(|cache| cache.seed == config.seed)?
+            .clone();
+        Some((
+            ProductionPreparationRequest {
+                session_generation: self.guidance.session_generation(),
+                selected_candidate: self.selected,
+                observed_position,
+                encounter_start: plan.encounter_start,
+                query,
+            },
+            cache,
+        ))
+    }
+
+    /// ワーカー上でSFMTキャッシュを必要位置まで延長し、本番Timelineを計算する。
+    pub(crate) fn calculate_production_preparation(
+        request: ProductionPreparationRequest,
+        cache: ObservationCache,
+    ) -> Result<PreparedProduction, AppError> {
+        let query = request.query;
+        if cache.seed != query.seed {
+            return Err(AppError::Cache(CacheError::SeedMismatch));
+        }
+        let base_start = request.encounter_start;
+        let mut start = base_start;
+        if let Some(ticks) = query.fastest_ticks {
+            let advance_values = ticks
+                .max(0)
+                .saturating_mul(query.models as i64)
+                .saturating_add(query.models as i64 + 1);
+            let required_end = base_start.saturating_add(advance_values).min(MAX_FRAME);
+            cache.ensure_through(required_end, None)?;
+            let count = usize::try_from(required_end.saturating_sub(base_start) + 1)
+                .map_err(|_| AppError::ArithmeticOverflow(ArithmeticOperation::TimelineLength))?;
+            let values = cache.read_values(base_start, count)?;
+            start =
+                advance_timeline_from_values(&values, base_start, base_start, query.models, ticks)
+                    .ok_or(AppError::InvalidState(StateIssue::TimelineUnavailable))?;
+        }
+
+        let timeline_values = PRODUCTION_TIMELINE_CACHE_FRAMES
+            .saturating_add(query.models as i64)
+            .saturating_add(1);
+        // Timeline用の固定窓を要求する。ObservationCache側が要求位置の先に
+        // 1チャンクを維持し、末尾1チャンクへ入った時点で次を追記する。
+        let required_end = start
+            .saturating_add(timeline_values)
+            .saturating_sub(1)
+            .min(MAX_FRAME);
+        cache.ensure_through(required_end, None)?;
+
+        let available = cache
+            .available_end()
+            .saturating_sub(start)
+            .saturating_add(1);
+        let count = usize::try_from(available.min(timeline_values).max(0))
+            .map_err(|_| AppError::ArithmeticOverflow(ArithmeticOperation::TimelineLength))?;
+        let values = cache.read_values(start, count)?;
+        let mut timeline = ProductionTimelineCache::new_from_values(
+            query.seed,
+            start,
+            query.models,
+            PRODUCTION_TIMELINE_CACHE_FRAMES,
+            values,
+        )
+        .ok_or(AppError::InvalidState(StateIssue::TimelineUnavailable))?;
+        timeline.extend_until(query.target);
+        let target_tick = timeline
+            .target_from(start, query.target)
+            .and_then(|timing| timing.exact_tick);
+        Ok(PreparedProduction {
+            cache: timeline,
+            production: ProductionTimeline {
+                target: query.target,
+                target_tick,
+            },
         })
+    }
+
+    /// 入力条件がワーカー要求と同じ場合だけ、計算済みTimelineを状態へ反映する。
+    pub(crate) fn apply_production_preparation(
+        &mut self,
+        request: &ProductionPreparationRequest,
+        prepared: PreparedProduction,
+    ) -> bool {
+        let matches = self
+            .production_preparation_request()
+            .is_some_and(|(current, _)| current == *request);
+        if !matches {
+            return false;
+        }
+        self.production_cache = Some(prepared.cache);
+        self.production = Some(prepared.production);
+        for (index, candidate) in self.candidates.iter_mut().enumerate() {
+            candidate.target_reachable =
+                index == self.selected && prepared.production.target_tick.is_some();
+        }
+        self.production_preparation_pending = false;
+        if std::mem::take(&mut self.encounter_start_requested) {
+            self.begin_encounter();
+        }
+        true
+    }
+
+    pub(crate) fn mark_production_preparation_pending(&mut self) {
+        self.clear_guidance_reachability();
+        self.production = None;
+        self.production_preparation_pending = true;
+        self.encounter_start_requested = false;
+        for candidate in &mut self.candidates {
+            candidate.target_reachable = false;
+        }
+    }
+
+    pub(crate) fn mark_production_preparation_pending_preserving_guidance(&mut self) {
+        self.production = None;
+        self.production_preparation_pending = true;
+        for candidate in &mut self.candidates {
+            candidate.target_reachable = false;
+        }
+    }
+
+    pub(crate) fn finish_production_preparation_without_result(&mut self) {
+        self.production_preparation_pending = false;
+        self.encounter_start_requested = false;
+        self.production = None;
+        for candidate in &mut self.candidates {
+            candidate.target_reachable = false;
+        }
     }
 
     /// 通常待機でTargetを正確に踏めない場合でも、TimelineがTargetを通過する
     /// ステップを待機時間の目安として返す。○×とは独立した表示用の値である。
-    fn normal_target_wait_ticks(&self, position: i64) -> Option<i64> {
-        let config = self.search_config().ok()?;
-        let query = ProductionQuery {
-            seed: config.seed,
-            target: config.target,
-            models: config.npc_models,
-            offset: self.encounter_offset_value(),
-            consider_rotom: self.consider_rotom_talk,
-            rotom_threshold: self.rotom_threshold_value(),
-            observed_rotom_talk: self.observed_rotom_talk,
-            pre_rotom_consumption: self.pre_rotom_consumption_value(),
-            npc_initial_load: self.npc_initial_load_value(),
-            fastest_ticks: None,
+    fn normal_target_wait_ticks(&self, position: i64) -> Result<Option<i64>, AppError> {
+        let Ok(config) = self.search_config() else {
+            return Ok(None);
         };
-        let start = query.encounter_start(position)?;
-        self.production_cache
+        if config.target.saturating_sub(position) > MAX_PRODUCTION_LOOKAHEAD {
+            return Ok(None);
+        }
+        let Some(start) = self.plan_for_encounter(
+            config.seed,
+            position,
+            self.encounter_offset_value(),
+            self.consider_rotom_talk,
+            self.rotom_threshold_value(),
+            self.observed_rotom_talk,
+        ) else {
+            return Ok(None);
+        };
+        let start = start.encounter_start;
+        let cached_timing = self
+            .production_cache
             .as_ref()
             .filter(|cache| cache.seed == config.seed && cache.models == config.npc_models)
-            .and_then(|cache| cache.target_from(start, config.target))
-            .or_else(|| timeline_target(config.seed, start, config.target, config.npc_models))
-            .map(|timing| timing.timeline_tick)
+            .and_then(|cache| cache.target_from(start, config.target));
+        if let Some(timing) = cached_timing {
+            return Ok(Some(timing.timeline_tick));
+        }
+        match self
+            .observation_cache
+            .as_ref()
+            .filter(|cache| cache.seed == config.seed)
+        {
+            Some(cache) => {
+                Ok(
+                    timeline_target_from_cache(cache, start, config.target, config.npc_models)?
+                        .map(|timing| timing.timeline_tick),
+                )
+            }
+            None => Ok(None),
+        }
     }
 
     fn make_candidate(&self, matched: ObservationMatch) -> TimelineCandidate {
@@ -1711,32 +1954,36 @@ impl AppState {
             start_position: matched.start_position,
             sfmt_position: matched.sfmt_position,
             next_blink_ticks: Some(matched.next_blink_ticks),
-            // rematch_candidates直後のrefresh_productionで、現在の入力条件に
-            // 基づく本番判定を同じ候補行へ書き込む。
+            // 選択候補の本番到達可否は、候補確定後にWorkerで計算して反映する。
             target_reachable: false,
         }
     }
 
     fn refresh_production(&mut self) {
         if self.encounter_offset_error().is_some() {
+            self.production_preparation_pending = false;
             for candidate in &mut self.candidates {
                 candidate.target_reachable = false;
             }
             self.production = None;
             return;
         }
-        // 選択候補は連続した本番キャッシュを保持している。同じ候補を別の全Timeline計算で
-        // 再生成せず、その結果を再利用する。
-        let selected_production = self.production_for_selected();
-        let selected_reachable = selected_production
-            .as_ref()
-            .is_some_and(|timeline| timeline.target_tick.is_some());
-        // 未選択候補はUiAppのワーカーで評価し、候補が多い検索でも描画を止めない。
-        // 結果が届くまでは古い値を表示せず、未到達として扱う。
-        for (candidate_pos, candidate) in self.candidates.iter_mut().enumerate() {
-            candidate.target_reachable = candidate_pos == self.selected && selected_reachable;
+        self.mark_production_preparation_pending();
+    }
+
+    /// 現在位置だけが進んだ場合は、本番Timelineを更新しつつ、絶対位置ごとの
+    /// 到達判定キャッシュは維持する。設定変更時の通常更新とは分ける。
+    fn refresh_production_preserving_guidance(&mut self) {
+        if self.encounter_offset_error().is_some() {
+            self.production_preparation_pending = false;
+            self.encounter_start_requested = false;
+            for candidate in &mut self.candidates {
+                candidate.target_reachable = false;
+            }
+            self.production = None;
+            return;
         }
-        self.production = selected_production;
+        self.mark_production_preparation_pending_preserving_guidance();
     }
 
     // --- Candidate reachability and guidance ------------------------------
@@ -1755,7 +2002,7 @@ impl AppState {
             return None;
         }
         Some(CandidateReachabilityRequest {
-            session_generation: self.guidance_session_generation,
+            session_generation: self.guidance.session_generation(),
             seed: config.seed,
             target: config.target,
             models: config.npc_models,
@@ -1778,6 +2025,7 @@ impl AppState {
 
     /// 候補ごとの本番Timeline判定。重い処理なのでUiAppからバックグラウンド
     /// で呼び出し、完了後に同じ入力スナップショットへだけ反映する。
+    #[cfg(test)]
     pub fn calculate_candidate_reachability(
         request: CandidateReachabilityRequest,
     ) -> Vec<(usize, bool)> {
@@ -1806,6 +2054,135 @@ impl AppState {
             .collect()
     }
 
+    /// 候補複数時の到達判定を、観測時に作成したSFMTキャッシュから計算する。
+    ///
+    /// 候補ごとに`ProductionQuery`を呼ぶと、それぞれがSeedから開始Frameまで
+    /// SFMTを再生する。候補範囲を一度だけ位置指定で読み、同じ列を共有する。
+    pub fn calculate_candidate_reachability_from_cache(
+        request: CandidateReachabilityRequest,
+        cache: &ObservationCache,
+    ) -> Result<Vec<(usize, bool)>, AppError> {
+        let false_results = || {
+            request
+                .candidate_positions
+                .iter()
+                .map(|(candidate, _)| (*candidate, false))
+                .collect::<Vec<_>>()
+        };
+        if cache.seed != request.seed {
+            return Err(AppError::Cache(CacheError::SeedMismatch));
+        }
+        if request.target.saturating_sub(
+            request
+                .candidate_positions
+                .iter()
+                .map(|(_, frame)| *frame)
+                .min()
+                .unwrap_or(request.target),
+        ) > MAX_PRODUCTION_LOOKAHEAD
+        {
+            return Ok(false_results());
+        }
+        let Some(min_observed) = request
+            .candidate_positions
+            .iter()
+            .map(|(_, frame)| *frame)
+            .min()
+        else {
+            return Ok(Vec::new());
+        };
+        let max_observed = request
+            .candidate_positions
+            .iter()
+            .map(|(_, frame)| *frame)
+            .max()
+            .unwrap_or(min_observed);
+        let Some(b_start) = min_observed.checked_add(request.pre_rotom_consumption) else {
+            return Ok(false_results());
+        };
+        let Some(b_count) = max_observed
+            .checked_sub(min_observed)
+            .and_then(|span| span.checked_add(1))
+            .and_then(|count| usize::try_from(count).ok())
+        else {
+            return Ok(false_results());
+        };
+        let b_values = cache.read_values(b_start, b_count)?;
+        let mut planned = Vec::with_capacity(request.candidate_positions.len());
+        for &(candidate, observed) in &request.candidate_positions {
+            let Some(value) = observed
+                .checked_sub(min_observed)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .and_then(|offset| b_values.get(offset).copied())
+            else {
+                return Ok(false_results());
+            };
+            let Some(plan) = crate::domain::rng::encounter_plan_with_pre_rotom_value(
+                observed,
+                request.offset,
+                request.consider_rotom,
+                request.rotom_threshold,
+                request.observed_rotom_talk,
+                request.pre_rotom_consumption,
+                request.npc_initial_load,
+                value,
+            ) else {
+                return Ok(false_results());
+            };
+            planned.push((candidate, plan.encounter_start));
+        }
+        if let Some(ticks) = request.fastest_ticks {
+            let Some(min_start) = planned.iter().map(|(_, start)| *start).min() else {
+                return Ok(Vec::new());
+            };
+            let max_start = planned
+                .iter()
+                .map(|(_, start)| *start)
+                .max()
+                .unwrap_or(min_start);
+            let Some(count) = max_start
+                .checked_sub(min_start)
+                .and_then(|span| {
+                    span.checked_add(ticks.max(0).saturating_mul(request.models as i64))
+                })
+                .and_then(|span| span.checked_add(request.models as i64 + 1))
+                .and_then(|count| usize::try_from(count).ok())
+            else {
+                return Ok(false_results());
+            };
+            let values = cache.read_values(min_start, count)?;
+            for (_, start) in &mut planned {
+                let Some(advanced) =
+                    advance_timeline_from_values(&values, min_start, *start, request.models, ticks)
+                else {
+                    return Ok(false_results());
+                };
+                *start = advanced;
+            }
+        }
+        let Some(min_start) = planned.iter().map(|(_, start)| *start).min() else {
+            return Ok(Vec::new());
+        };
+        let max_start = planned
+            .iter()
+            .map(|(_, start)| *start)
+            .max()
+            .unwrap_or(min_start);
+        let by_start: HashMap<i64, bool> = target_reachability_range_from_cache(
+            cache,
+            min_start..=max_start,
+            request.target,
+            request.models,
+            None,
+        )?
+        .into_iter()
+        .collect();
+        Ok(planned
+            .into_iter()
+            .map(|(candidate, start)| (candidate, by_start.get(&start).copied().unwrap_or(false)))
+            .collect())
+    }
+
     pub fn apply_candidate_reachability(
         &mut self,
         request: &CandidateReachabilityRequest,
@@ -1827,25 +2204,26 @@ impl AppState {
     pub fn recalculate_production(&mut self) {
         self.clear_guidance_reachability();
         self.fast_close_circle_frames.clear();
-        if !self.candidates.is_empty() {
-            self.refresh_production();
+        self.production = None;
+        self.production_preparation_pending = !self.candidates.is_empty();
+        self.encounter_start_requested = false;
+        for candidate in &mut self.candidates {
+            candidate.target_reachable = false;
         }
     }
 
     /// 実測ロトム結果だけを更新したときの本番経路更新。右上の○×は
     /// 設定確率だけで判定するため、既に計算済みの案内結果を消さない。
     pub fn recalculate_production_preserving_guidance(&mut self) {
-        if !self.candidates.is_empty() {
-            self.refresh_production();
-        }
+        self.mark_production_preparation_pending_preserving_guidance();
     }
 
     /// 表の指定位置からTarget Frameへ到達できるかを遅延計算する。
     /// 到達可否は瞬き検索の結果ではなく、本番NPCタイムラインの結果で決まる。
     #[cfg(test)]
     pub fn table_target_reachable(&mut self, frame: i64) -> Option<bool> {
-        if let Some(reachable) = self.table_reachability.get(&frame) {
-            return Some(*reachable);
+        if let Some(reachable) = self.guidance.reachability(frame) {
+            return Some(reachable);
         }
         let config = self.search_config().ok()?;
         if config.target.saturating_sub(frame) > MAX_PRODUCTION_LOOKAHEAD {
@@ -1915,7 +2293,7 @@ impl AppState {
             .min(plan.search_end);
         let config = plan.config;
         Some(GuidanceSearchRequest {
-            session_generation: self.guidance_session_generation,
+            session_generation: self.guidance.session_generation(),
             observed_start,
             observed_end,
             range_start: config.range_start,
@@ -1966,20 +2344,20 @@ impl AppState {
         for (frame, reachable) in results {
             self.record_guidance_reachability(frame, reachable);
         }
-        self.guidance_computed_until = Some(
-            self.guidance_computed_until
-                .unwrap_or(request.observed_end)
-                .max(request.observed_end),
-        );
+        self.guidance.mark_computed_until(request.observed_end);
     }
 
     /// 右上の○×案内。現在位置から次に○となる孵化瞬き位置と、その位置が
     /// 続く実時間を同じSFMT行から求める。
-    pub fn hatch_guidance(&mut self) -> Option<HatchGuidance> {
-        let cache = self.observation_cache.clone()?;
-        let plan = self.guidance_scan_plan()?;
+    pub fn hatch_guidance(&mut self) -> Result<Option<HatchGuidance>, AppError> {
+        let Some(cache) = self.observation_cache.clone() else {
+            return Ok(None);
+        };
+        let Some(plan) = self.guidance_scan_plan() else {
+            return Ok(None);
+        };
         if plan.target_too_far {
-            return Some(HatchGuidance {
+            return Ok(Some(HatchGuidance {
                 current_frame: plan.current,
                 current_reachability: Some(false),
                 reachable_now: false,
@@ -1990,7 +2368,7 @@ impl AppState {
                 target_wait_seconds: None,
                 target_unreachable: false,
                 search_out_of_range: true,
-            });
+            }));
         }
         let current = plan.current;
         // 最速閉じの理論範囲外はWorkerへ渡していないが、到達不能である
@@ -2000,7 +2378,7 @@ impl AppState {
             if self.fastest_close && (current < plan.search_start || current > plan.search_end) {
                 Some(false)
             } else {
-                self.table_reachability.get(&current).copied()
+                self.guidance.reachability(current)
             };
         let fastest_bounds = plan.fastest_bounds;
         let search_start = plan.search_start;
@@ -2008,12 +2386,7 @@ impl AppState {
         // 理論上の候補範囲より前は最速閉じでは○にならないため、そこを
         // 計算せずに飛ばしつつ、到達可能位置の順序付き索引から次○を取る。
         let next_circle = (search_start <= scan_end)
-            .then(|| {
-                self.guidance_reachable_frames
-                    .range(search_start..=scan_end)
-                    .next()
-                    .copied()
-            })
+            .then(|| self.guidance.next_reachable(search_start, scan_end))
             .flatten();
         let blinks = next_circle
             .map(|frame| {
@@ -2040,9 +2413,8 @@ impl AppState {
         let blinks_until_circle = if reachable_now {
             let next_start = current.saturating_add(1);
             if next_start <= scan_end {
-                self.guidance_reachable_frames
-                    .range(next_start..=scan_end)
-                    .next()
+                self.guidance
+                    .next_reachable(next_start, scan_end)
                     .map(|frame| {
                         frame
                             .saturating_sub(current)
@@ -2064,57 +2436,72 @@ impl AppState {
             }
         }
         let search_pending = self.guidance_search_pending();
-        let next_circle_seconds = next_circle.and_then(|end| {
-            let count = end
+        let next_circle_seconds = if let Some(end) = next_circle {
+            if let Some(count) = end
                 .checked_sub(current)
-                .and_then(|value| usize::try_from(value).ok())?;
-            if count == 0 {
-                return Some(0.0);
+                .and_then(|value| usize::try_from(value).ok())
+            {
+                if count == 0 {
+                    Some(0.0)
+                } else if let Some(intervals) =
+                    self.guidance_interval_seconds_range(&cache, current, count)?
+                {
+                    let full_seconds: f64 = intervals.iter().sum();
+                    // 最初の区間は既に一部経過している場合がある。瞬きタイマー実行中は区間全体の
+                    // 長さを現在の締切へ置き換え、整数表示を実時間の経過に合わせる。
+                    intervals.first().copied().map(|first_full| {
+                        let first_remaining = self
+                            .next_blink
+                            .map(|deadline| {
+                                deadline
+                                    .saturating_duration_since(Instant::now())
+                                    .as_secs_f64()
+                            })
+                            .unwrap_or(first_full);
+                        (full_seconds - first_full + first_remaining).max(0.0)
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
             }
-            let intervals =
-                self.guidance_interval_seconds_range(&cache, plan.config.seed, current, count)?;
-            let full_seconds: f64 = intervals.iter().sum();
-            // 最初の区間は既に一部経過している場合がある。瞬きタイマー実行中は区間全体の
-            // 長さを現在の締切へ置き換え、整数表示を実時間の経過に合わせる。
-            let first_full = intervals.first().copied()?;
-            let first_remaining = self
-                .next_blink
-                .map(|deadline| {
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_secs_f64()
-                })
-                .unwrap_or(first_full);
-            Some((full_seconds - first_full + first_remaining).max(0.0))
-        });
-        let grace_seconds = next_circle.and_then(|start| {
+        } else {
+            None
+        };
+        let grace_seconds = if let Some(start) = next_circle {
             let mut total = 0.0;
             // 未来の検索が続いている場合、既知範囲の末尾まで○が続くだけ
             // では猶予秒数を確定できない。既知の×に到達した場合は、そこが
             // ○区間の正常な終端なので、その時点で確定できる。
             let mut complete = !search_pending;
-            let count = scan_end
+            let Some(count) = scan_end
                 .checked_sub(start)
                 .and_then(|value| value.checked_add(1))
-                .and_then(|value| usize::try_from(value).ok())?;
-            let seconds =
-                self.guidance_interval_seconds_range(&cache, plan.config.seed, start, count)?;
-            for (offset, seconds) in seconds.into_iter().enumerate() {
-                let frame = start.saturating_add(offset as i64);
-                match self.table_reachability.get(&frame) {
-                    Some(true) => total += seconds,
-                    Some(false) => {
-                        complete = true;
-                        break;
-                    }
-                    None => {
-                        complete = false;
-                        break;
+                .and_then(|value| usize::try_from(value).ok())
+            else {
+                return Ok(None);
+            };
+            if let Some(seconds) = self.guidance_interval_seconds_range(&cache, start, count)? {
+                for (offset, seconds) in seconds.into_iter().enumerate() {
+                    let frame = start.saturating_add(offset as i64);
+                    match self.guidance.reachability(frame) {
+                        Some(true) => total += seconds,
+                        Some(false) => {
+                            complete = true;
+                            break;
+                        }
+                        None => {
+                            complete = false;
+                            break;
+                        }
                     }
                 }
             }
             (complete && total > 0.0).then_some(total)
-        });
+        } else {
+            None
+        };
         // Targetの検索範囲外表示は、現在地からの共通上限を超えた場合
         // だけに限定する。通常待機では観測範囲の終点を越えても、現在の
         // TimelineからTargetまでの本番待機時間を計算できる。
@@ -2130,19 +2517,26 @@ impl AppState {
             && !search_out_of_range
             && (fastest_target_unreachable
                 || (!self.fastest_close && plan.config.target < current));
-        let target_wait_seconds = if self.fastest_close {
+        let target_wait_seconds = if self.fastest_close || self.production_preparation_pending {
             None
         } else {
             let target_ticks = self
                 .production
                 .as_ref()
                 .and_then(|production| production.target_tick);
-            let target_ticks = target_ticks
-                .or_else(|| self.normal_target_wait_ticks(current))
-                .or_else(|| next_circle.and_then(|frame| self.normal_target_wait_ticks(frame)));
+            let target_ticks = match target_ticks {
+                Some(ticks) => Some(ticks),
+                None => match self.normal_target_wait_ticks(current)? {
+                    Some(ticks) => Some(ticks),
+                    None => match next_circle {
+                        Some(frame) => self.normal_target_wait_ticks(frame)?,
+                        None => None,
+                    },
+                },
+            };
             target_ticks.map(|ticks| self.game_ticks_to_seconds(ticks))
         };
-        Some(HatchGuidance {
+        Ok(Some(HatchGuidance {
             current_frame: current,
             current_reachability,
             reachable_now,
@@ -2153,7 +2547,7 @@ impl AppState {
             target_wait_seconds,
             target_unreachable,
             search_out_of_range,
-        })
+        }))
     }
 
     /// 右上案内の次チャンクを継続計算する必要があるか。
@@ -2208,6 +2602,7 @@ impl AppState {
         Some((search_start, search_end, fully_covered))
     }
 
+    #[cfg(test)]
     pub fn calculate_guidance_batch(request: GuidanceSearchRequest) -> Vec<(i64, bool)> {
         // UIは表示中の現在位置から始まるチャンクだけを要求する。Targetが本番窓の上限を
         // 超えている場合は全てfalseの軽い結果を返し、遠いTargetまでSFMTを生成しない。
@@ -2269,12 +2664,134 @@ impl AppState {
             .collect()
     }
 
+    /// 既生成のSFMTキャッシュだけを使って、右上案内の1チャンクを計算する。
+    ///
+    /// チャンクごとにSeedから現在位置まで再生すると、高いFrameでは同じ長い
+    /// SFMT prefixを何度も再計算することになる。ここではB位置とTarget判定の
+    /// 両方を絶対位置指定でキャッシュから読み、作業量を対象チャンクに限定する。
+    pub fn calculate_guidance_batch_from_cache(
+        request: GuidanceSearchRequest,
+        cache: &ObservationCache,
+    ) -> Result<Vec<(i64, bool)>, AppError> {
+        let empty_results = || {
+            (request.observed_start..=request.observed_end)
+                .map(|frame| (frame, false))
+                .collect::<Vec<_>>()
+        };
+        if cache.seed != request.seed {
+            return Err(AppError::Cache(CacheError::SeedMismatch));
+        }
+        if request.target.saturating_sub(request.observed_start) > MAX_PRODUCTION_LOOKAHEAD {
+            return Ok(empty_results());
+        }
+        let Some(b_start) = request
+            .observed_start
+            .checked_add(request.pre_rotom_consumption)
+        else {
+            return Ok(empty_results());
+        };
+        let Some(b_count) = request
+            .observed_end
+            .checked_sub(request.observed_start)
+            .and_then(|span| span.checked_add(1))
+            .and_then(|count| usize::try_from(count).ok())
+        else {
+            return Ok(empty_results());
+        };
+        let b_values = cache.read_values(b_start, b_count)?;
+        let mut planned = Vec::with_capacity(b_count);
+        for (index, frame) in (request.observed_start..=request.observed_end).enumerate() {
+            let Some(value) = b_values.get(index).copied() else {
+                return Ok(empty_results());
+            };
+            let Some(plan) = crate::domain::rng::encounter_plan_with_pre_rotom_value(
+                frame,
+                request.offset,
+                request.consider_rotom,
+                request.rotom_threshold,
+                request.observed_rotom_talk,
+                request.pre_rotom_consumption,
+                request.npc_initial_load,
+                value,
+            ) else {
+                return Ok(empty_results());
+            };
+            planned.push((frame, plan.encounter_start));
+        }
+        let Some(min_start) = planned.iter().map(|(_, start)| *start).min() else {
+            return Ok(empty_results());
+        };
+        let max_start = planned
+            .iter()
+            .map(|(_, start)| *start)
+            .max()
+            .unwrap_or(min_start);
+        let by_start: HashMap<i64, bool> = target_reachability_range_from_cache(
+            cache,
+            min_start..=max_start,
+            request.target,
+            request.models,
+            request.fastest_ticks,
+        )?
+        .into_iter()
+        .collect();
+        Ok(planned
+            .into_iter()
+            .map(|(observed, start)| (observed, by_start.get(&start).copied().unwrap_or(false)))
+            .collect())
+    }
+
     pub fn rotom_talk_at(&self, frame: i64) -> Option<bool> {
-        rotom_roll_at(
-            self.search_config().ok()?.seed,
-            frame.saturating_add(self.pre_rotom_consumption_value()),
-        )
-        .map(|roll| u64::from(roll) < self.rotom_threshold_value())
+        let seed = self.search_config().ok()?.seed;
+        let position = frame.saturating_add(self.pre_rotom_consumption_value());
+        let roll = self.cached_rotom_roll_at(seed, position)?;
+        Some(u64::from(roll) < self.rotom_threshold_value())
+    }
+
+    fn cached_rotom_roll_at(&self, seed: u32, position: i64) -> Option<u8> {
+        let cache = self
+            .observation_cache
+            .as_ref()
+            .filter(|cache| cache.seed == seed)?;
+        match cache.read_values(position, 1) {
+            Ok(values) => values.first().map(|value| (value % 100) as u8),
+            Err(error) => {
+                self.defer_cache_io_error(error);
+                None
+            }
+        }
+    }
+
+    fn defer_cache_io_error(&self, error: AppError) {
+        if error.is_cache_io() {
+            if let Ok(mut pending) = self.deferred_cache_io_error.lock() {
+                *pending = Some(error);
+            }
+        }
+    }
+
+    pub(crate) fn take_deferred_cache_io_error(&self) -> Option<AppError> {
+        self.deferred_cache_io_error
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
+    }
+
+    fn timeline_target_from_cache(
+        &self,
+        seed: u32,
+        start: i64,
+        target: i64,
+        models: usize,
+    ) -> Result<Option<crate::domain::rng::TimelineTarget>, AppError> {
+        match self
+            .observation_cache
+            .as_ref()
+            .filter(|cache| cache.seed == seed)
+        {
+            Some(cache) => timeline_target_from_cache(cache, start, target, models),
+            None => Ok(None),
+        }
     }
 }
 
@@ -2287,6 +2804,21 @@ mod tests {
         encounter_plan_with_pre_rotom_consumption, encounter_plan_with_rotom, production_timeline,
         ModelStatus, Sfmt,
     };
+
+    fn install_test_cache(state: &mut AppState) {
+        let config = state.search_config().unwrap();
+        state.observation_cache = crate::domain::rng::generate_observation_cache(
+            config.seed,
+            0..=100_000,
+            100_000,
+            config.fps,
+        )
+        .ok();
+        assert!(
+            state.observation_cache.is_some(),
+            "test SFMT cache must generate"
+        );
+    }
 
     fn main_reference_values(seed: u32, count: usize) -> Vec<u64> {
         let mut sfmt = Sfmt::new(seed);
@@ -2496,6 +3028,75 @@ mod tests {
     }
 
     #[test]
+    fn cached_guidance_batch_matches_seed_replay_at_a_high_absolute_position() {
+        let request = GuidanceSearchRequest {
+            session_generation: 0,
+            observed_start: 50_000,
+            observed_end: 50_080,
+            range_start: 0,
+            range_end: 100_000,
+            seed: 1,
+            target: 50_140,
+            models: 23,
+            offset: 0,
+            consider_rotom: false,
+            rotom_threshold: 79,
+            observed_rotom_talk: None,
+            pre_rotom_consumption: 0,
+            npc_initial_load: 0,
+            fastest_ticks: None,
+        };
+        let cache = crate::domain::rng::generate_observation_cache(
+            request.seed,
+            request.range_start..=request.range_end,
+            request.target,
+            DEFAULT_FPS,
+        )
+        .unwrap();
+
+        assert_eq!(
+            AppState::calculate_guidance_batch_from_cache(request, &cache).unwrap(),
+            main_reference_guidance_batch(request)
+        );
+    }
+
+    #[test]
+    fn candidate_reachability_from_cache_matches_seed_replay() {
+        let seed = 0x8A31_42C7;
+        let models = 4;
+        let initial =
+            encounter_plan_with_observed_rotom_and_initial_load(seed, 10, 0, true, 79, None, 2)
+                .unwrap()
+                .encounter_start;
+        let target = advance_timeline(seed, initial, models, 25).unwrap();
+        let cache =
+            crate::domain::rng::generate_observation_cache(seed, 0..=1_000, target, DEFAULT_FPS)
+                .unwrap();
+
+        for fastest_ticks in [None, Some(5)] {
+            let request = CandidateReachabilityRequest {
+                session_generation: 0,
+                seed,
+                target,
+                models,
+                offset: 0,
+                consider_rotom: true,
+                rotom_threshold: 79,
+                observed_rotom_talk: None,
+                pre_rotom_consumption: 0,
+                npc_initial_load: 2,
+                fastest_ticks,
+                candidate_positions: vec![(0, 10), (1, 20)],
+            };
+            assert_eq!(
+                AppState::calculate_candidate_reachability_from_cache(request.clone(), &cache)
+                    .unwrap(),
+                AppState::calculate_candidate_reachability(request),
+            );
+        }
+    }
+
+    #[test]
     fn default_beep_settings_are_half_second_and_six_times() {
         let state = AppState::default();
 
@@ -2618,6 +3219,40 @@ mod tests {
     }
 
     #[test]
+    fn production_preparation_builds_the_selected_timeline_off_the_cached_sequence() {
+        let mut state = AppState::default();
+        state.seed = "00000001".into();
+        state.range_start = "0".into();
+        state.range_end = "1000".into();
+        state.target = "5000".into();
+        state.npc = "5".into();
+        state.candidates = vec![TimelineCandidate {
+            start_position: 0,
+            sfmt_position: 1000,
+            next_blink_ticks: Some(130),
+            target_reachable: false,
+        }];
+        install_test_cache(&mut state);
+        state.recalculate_production();
+        assert!(state.production_preparation_pending);
+        assert!(state.production.is_none());
+
+        let (request, cache) = state
+            .production_preparation_request()
+            .expect("production request");
+        let prepared = AppState::calculate_production_preparation(request.clone(), cache)
+            .expect("prepared production timeline");
+
+        assert_eq!(prepared.production.target, 5000);
+        assert!(state.apply_production_preparation(&request, prepared));
+        assert!(!state.production_preparation_pending);
+        assert_eq!(
+            state.production.as_ref().map(|value| value.target),
+            Some(5000)
+        );
+    }
+
+    #[test]
     fn incomplete_guidance_results_do_not_advance_computed_end() {
         let mut state = AppState::default();
         let request = GuidanceSearchRequest {
@@ -2640,8 +3275,8 @@ mod tests {
 
         state.apply_guidance_results(request, vec![(10, false), (12, true)]);
 
-        assert_eq!(state.guidance_computed_until, None);
-        assert!(state.table_reachability.is_empty());
+        assert_eq!(state.guidance.computed_until(), None);
+        assert!(state.guidance.is_empty());
     }
 
     #[test]
@@ -2730,7 +3365,12 @@ mod tests {
         let request = state.guidance_search_request().unwrap();
         let results = AppState::calculate_guidance_batch(request);
         state.apply_guidance_results(request, results);
-        assert!(state.hatch_guidance().unwrap().next_circle_frame.is_some());
+        assert!(state
+            .hatch_guidance()
+            .unwrap()
+            .unwrap()
+            .next_circle_frame
+            .is_some());
     }
 
     #[test]
@@ -2760,7 +3400,7 @@ mod tests {
         first_request.observed_end = first_request.observed_start;
         state.apply_guidance_results(first_request, vec![first_result]);
 
-        let guidance = state.hatch_guidance().unwrap();
+        let guidance = state.hatch_guidance().unwrap().unwrap();
         assert_eq!(guidance.current_reachability, Some(first_result.1));
         assert!(state.guidance_search_pending());
     }
@@ -2796,7 +3436,10 @@ mod tests {
             .collect();
         state.apply_guidance_results(request, results);
 
-        let guidance = state.hatch_guidance().expect("guidance snapshot");
+        let guidance = state
+            .hatch_guidance()
+            .expect("guidance calculation")
+            .expect("guidance snapshot");
         assert_eq!(guidance.current_reachability, Some(false));
         assert!(guidance.target_unreachable);
     }
@@ -2825,7 +3468,7 @@ mod tests {
         let request = state.guidance_search_request().unwrap();
         let results = AppState::calculate_guidance_batch(request);
         state.apply_guidance_results(request, results);
-        let guidance = state.hatch_guidance().unwrap();
+        let guidance = state.hatch_guidance().unwrap().unwrap();
         assert!(guidance.next_circle_frame.is_some());
         assert!(guidance.grace_seconds.is_some());
     }
@@ -2854,7 +3497,10 @@ mod tests {
             }];
             state.next_blink_index = Some(4800);
 
-            let guidance = state.hatch_guidance().expect("guidance snapshot");
+            let guidance = state
+                .hatch_guidance()
+                .expect("guidance calculation")
+                .expect("guidance snapshot");
             assert!(guidance.search_out_of_range);
             assert!(!guidance.target_unreachable);
         }
@@ -2882,7 +3528,10 @@ mod tests {
         }];
         state.next_blink_index = Some(4800);
 
-        let guidance = state.hatch_guidance().expect("guidance snapshot");
+        let guidance = state
+            .hatch_guidance()
+            .expect("guidance calculation")
+            .expect("guidance snapshot");
         assert!(!guidance.search_out_of_range);
         assert!(!guidance.target_unreachable);
     }
@@ -2909,7 +3558,10 @@ mod tests {
         }];
         state.next_blink_index = Some(4800);
 
-        let guidance = state.hatch_guidance().expect("guidance snapshot");
+        let guidance = state
+            .hatch_guidance()
+            .expect("guidance calculation")
+            .expect("guidance snapshot");
         assert!(!guidance.search_out_of_range);
         assert!(guidance.target_unreachable);
     }
@@ -2941,8 +3593,8 @@ mod tests {
         let result = vec![(current.observed_start, false)];
         state.apply_guidance_results(stale, result);
 
-        assert!(state.table_reachability.is_empty());
-        assert_eq!(state.guidance_computed_until, None);
+        assert!(state.guidance.is_empty());
+        assert_eq!(state.guidance.computed_until(), None);
     }
 
     #[test]
@@ -2965,12 +3617,11 @@ mod tests {
             next_blink_ticks: Some(130),
             target_reachable: false,
         }];
-        state.table_reachability.insert(3000, true);
-        state.table_reachability.insert(3001, false);
-        state.guidance_reachable_frames.insert(3000);
-        state.guidance_computed_until = Some(3001);
+        state.guidance.record_reachability(3000, true);
+        state.guidance.record_reachability(3001, false);
+        state.guidance.mark_computed_until(3001);
 
-        let guidance = state.hatch_guidance().unwrap();
+        let guidance = state.hatch_guidance().unwrap().unwrap();
         assert_eq!(guidance.current_reachability, Some(true));
         assert!(guidance.grace_seconds.is_some());
         assert!(state.guidance_search_pending());
@@ -3000,7 +3651,7 @@ mod tests {
             target_reachable: false,
         }];
 
-        let guidance = state.hatch_guidance().unwrap();
+        let guidance = state.hatch_guidance().unwrap().unwrap();
         assert_eq!(guidance.current_reachability, Some(false));
         assert!(state.guidance_search_pending());
     }
@@ -3028,7 +3679,10 @@ mod tests {
         }];
         state.next_blink_index = Some(4800);
 
-        let guidance = state.hatch_guidance().expect("guidance snapshot");
+        let guidance = state
+            .hatch_guidance()
+            .expect("guidance calculation")
+            .expect("guidance snapshot");
         assert_eq!(guidance.current_reachability, Some(false));
         assert!(state.guidance_search_request().is_some());
         assert!(state.guidance_search_pending());
@@ -3088,6 +3742,7 @@ mod tests {
         state.encounter_offset = "10".into();
         state.fastest_close = true;
         let config = state.search_config().unwrap();
+        install_test_cache(&mut state);
         let plan = encounter_plan_with_rotom(config.seed, 0, 0, true).unwrap();
         // 設定した10FオフセットはTimelineの5tickに相当する。Targetと実測Frameは
         // B+ロトムから続く同じ経路から求め、オフセット境界でModelStatusを初期化し直さない。
@@ -3108,6 +3763,7 @@ mod tests {
         state.use_offset = true;
         state.encounter_offset = "10".into();
         let config = state.search_config().unwrap();
+        install_test_cache(&mut state);
         let predicted = state.rotom_talk_at(0).unwrap();
         let predicted_plan = encounter_plan_with_observed_rotom(
             config.seed,
@@ -3149,6 +3805,7 @@ mod tests {
         state.encounter_offset = "216".into();
         state.correction_source_offset = Some(216);
         state.actual_target_frame = "3003".into();
+        install_test_cache(&mut state);
         // このseedでは○Frame 692に対し、Target=3000はtick508、実測Frame=3003は
         // tick509となり、表示Frameで2Fのずれになる。
         assert_eq!(state.suggested_offset_for_actual_from(692).unwrap(), 214);
@@ -3175,11 +3832,27 @@ mod tests {
             next_blink_ticks: None,
             target_reachable: false,
         }];
+        install_test_cache(&mut state);
         let preview = state.correction_preview_from(0).unwrap();
         assert_eq!(preview.suggested_offset, 100 - 4);
         assert_eq!(preview.timeline_start, source_plan.encounter_start);
         assert!(preview.target_on_timeline);
         assert!(preview.actual_on_timeline);
+    }
+
+    #[test]
+    fn correction_preview_reports_a_missing_seed_cache_as_calculation_unavailable() {
+        let mut state = AppState::default();
+        state.actual_target_frame = "1000".into();
+        state.candidates = vec![TimelineCandidate {
+            start_position: 0,
+            sfmt_position: 0,
+            next_blink_ticks: None,
+            target_reachable: false,
+        }];
+
+        let error = state.correction_preview_from(0).unwrap_err();
+        assert!(matches!(error, CorrectionPreviewError::CacheSeedMismatch));
     }
 
     #[test]
@@ -3203,6 +3876,7 @@ mod tests {
         }];
 
         let config = state.search_config().unwrap();
+        install_test_cache(&mut state);
         let expected = encounter_plan_with_pre_rotom_consumption(
             config.seed,
             0,
@@ -3236,6 +3910,7 @@ mod tests {
         let actual = advance_timeline(1, source_plan.encounter_start, 6, 1).unwrap();
         state.target = target.to_string();
         state.actual_target_frame = actual.to_string();
+        install_test_cache(&mut state);
 
         assert_eq!(state.suggested_offset_for_actual_from(0).unwrap(), 100);
     }
@@ -3256,6 +3931,7 @@ mod tests {
         assert!(actual < target);
         state.target = target.to_string();
         state.actual_target_frame = actual.to_string();
+        install_test_cache(&mut state);
 
         // オフセット着地後も同じModelStatus状態を継続する。新しい初期化境界ではなく、
         // 正負どちらの補正方向も有効である。
@@ -3273,6 +3949,7 @@ mod tests {
             advance_timeline(config.seed, plan.encounter_start, config.npc_models, 1).unwrap();
         let later =
             advance_timeline(config.seed, plan.encounter_start, config.npc_models, 2).unwrap();
+        install_test_cache(&mut state);
 
         // 通常待機で実測がTargetより後ろでも、負のオフセットを示すだけで補正操作は
         // 0Fの適用可能なプレビューを返す。
@@ -3302,6 +3979,7 @@ mod tests {
         let target =
             advance_timeline(config.seed, plan.encounter_start, config.npc_models, 5).unwrap();
         state.target = target.to_string();
+        install_test_cache(&mut state);
         assert_eq!(state.table_target_reachable(0), Some(true));
     }
 
@@ -3320,6 +3998,7 @@ mod tests {
         state.fast_close_circle_frames = vec![0];
         state.next_blink_index = Some(0);
         state.next_blink = Some(Instant::now() + Duration::from_secs(1));
+        install_test_cache(&mut state);
 
         assert!(state.finish_fastest_close_for_correction());
         assert!(matches!(state.mode, Mode::Finished));
@@ -3472,14 +4151,15 @@ mod tests {
         let mut state = AppState::default();
         state.fastest_close = true;
         state.fast_close_circle_frames = vec![0, 1];
-        state.guidance_reachable_frames.insert(123);
+        state.guidance.record_reachability(123, true);
+        install_test_cache(&mut state);
 
         assert!(state.set_correction_source_index(1));
         let predicted = state.predicted_rotom_talk_for_correction_source();
         assert!(predicted.is_some());
         assert!(state.sync_observed_rotom_to_correction_source());
         assert_eq!(state.observed_rotom_talk, predicted);
-        assert!(state.guidance_reachable_frames.contains(&123));
+        assert!(state.guidance.contains_reachable(123));
     }
 
     #[test]
@@ -3535,6 +4215,7 @@ mod tests {
         let mut state = AppState::default();
         state.fastest_close = true;
         state.fast_close_circle_frames = vec![0];
+        install_test_cache(&mut state);
         let predicted = state.rotom_talk_at(0).unwrap();
         state.observed_rotom_talk = Some(!predicted);
 
@@ -3581,6 +4262,14 @@ mod tests {
         let target =
             advance_timeline(config.seed, plan.encounter_start, config.npc_models, 5).unwrap();
         state.target = target.to_string();
+        install_test_cache(&mut state);
+        state.mark_production_preparation_pending();
+        let (request, cache) = state
+            .production_preparation_request()
+            .expect("production request");
+        let prepared = AppState::calculate_production_preparation(request.clone(), cache)
+            .expect("prepared production timeline");
+        assert!(state.apply_production_preparation(&request, prepared));
         let expected_tick =
             production_timeline(config.seed, plan.encounter_start, target, config.npc_models)
                 .target_tick
@@ -3606,8 +4295,50 @@ mod tests {
     }
 
     #[test]
+    fn hatch_timer_catches_up_after_fifty_million_frame_virtual_elapsed() {
+        let mut state = AppState::default();
+        let start = Instant::now();
+        let duration_seconds = game_frames_to_seconds(MAX_FRAME as f64, state.fps_value());
+        let virtual_now = start + Duration::from_secs_f64(duration_seconds);
+        state.mode = Mode::Production;
+        state.timer_start = Some(start);
+        state.timer_seconds = duration_seconds;
+
+        assert_eq!(state.remaining_at(virtual_now), 0.0);
+        assert!(state.finish_production_if_elapsed(virtual_now));
+        assert!(state.is_finished());
+        assert_eq!(state.remaining_at(virtual_now), 0.0);
+    }
+
+    #[test]
+    fn hatch_article_timer_catches_up_both_stages_after_long_virtual_elapsed() {
+        let mut state = AppState::default();
+        let start = Instant::now();
+        let long_wait = game_frames_to_seconds(MAX_FRAME as f64, state.fps_value());
+        let virtual_now = start + Duration::from_secs_f64(long_wait);
+        state.mode = Mode::Countdown;
+        state.article_timer_stage = Some(ArticleTimerStage::Offset);
+        state.article_timer_start = Some(start);
+        state.article_timer_seconds = game_frames_to_seconds(120.0, state.fps_value());
+        state.article_next_seconds = Some(30.0);
+
+        assert_eq!(
+            state.tick_article_timer_at(virtual_now),
+            Some(ArticleTimerStage::Offset)
+        );
+        assert_eq!(state.article_timer_stage, Some(ArticleTimerStage::ToTarget));
+        assert_eq!(
+            state.tick_article_timer_at(virtual_now),
+            Some(ArticleTimerStage::ToTarget)
+        );
+        assert!(state.is_finished());
+        assert_eq!(state.article_timer_start_time(), None);
+    }
+
+    #[test]
     fn observed_rotom_talk_does_not_change_configured_threshold() {
         let mut state = AppState::default();
+        install_test_cache(&mut state);
         state.candidates = vec![TimelineCandidate {
             start_position: 0,
             sfmt_position: 0,
@@ -3627,11 +4358,11 @@ mod tests {
     #[test]
     fn observed_rotom_talk_keeps_guidance_results() {
         let mut state = AppState::default();
-        state.guidance_reachable_frames.insert(123);
+        state.guidance.record_reachability(123, true);
 
         state.set_observed_rotom_talk(true);
 
-        assert!(state.guidance_reachable_frames.contains(&123));
+        assert!(state.guidance.contains_reachable(123));
     }
 
     #[test]
@@ -3815,6 +4546,111 @@ mod tests {
                 .abs()
                 < 0.001
         );
+    }
+
+    #[test]
+    fn predicted_blink_keeps_known_guidance_while_production_prepares() {
+        let mut state = AppState::default();
+        state.seed = "00000001".into();
+        state.range_start = "0".into();
+        state.range_end = "100".into();
+        state.target = "80".into();
+        state.npc = "1".into();
+        state.observation_cache =
+            crate::domain::rng::generate_observation_cache(1, 0..=200, 200, state.fps_value()).ok();
+        state.candidates = vec![TimelineCandidate {
+            start_position: 0,
+            sfmt_position: 0,
+            next_blink_ticks: Some(130),
+            target_reachable: true,
+        }];
+        state.next_blink = Some(Instant::now() + Duration::from_secs(10));
+        state.next_blink_index = Some(0);
+        state.record_guidance_reachability(1, false);
+        state.record_guidance_reachability(2, false);
+        state.record_guidance_reachability(3, true);
+        state.guidance.mark_computed_until(3);
+
+        state.advance_predicted_blink();
+
+        assert!(state.production_preparation_pending);
+        assert_eq!(state.next_blink_index, Some(1));
+        assert_eq!(state.guidance.reachability(1), Some(false));
+        assert_eq!(state.guidance.reachability(3), Some(true));
+        assert_eq!(
+            state
+                .hatch_guidance()
+                .expect("guidance calculation")
+                .and_then(|guidance| guidance.next_circle_frame),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn enter_during_production_preparation_starts_when_the_worker_result_arrives() {
+        let mut state = AppState::default();
+        state.mode = Mode::Ready;
+        state.fastest_close = false;
+        state.use_offset = false;
+        state.range_start = "0".into();
+        state.range_end = "1000".into();
+        state.target = "5000".into();
+        state.npc = "5".into();
+        state.candidates = vec![TimelineCandidate {
+            start_position: 0,
+            sfmt_position: 1000,
+            next_blink_ticks: Some(130),
+            target_reachable: false,
+        }];
+        install_test_cache(&mut state);
+        let config = state.search_config().expect("valid hatch conditions");
+        let predicted_rotom = state
+            .predicted_rotom_talk()
+            .expect("cached Rotom prediction");
+        let resolved_plan = state
+            .plan_for_encounter(
+                config.seed,
+                1000,
+                state.encounter_offset_value(),
+                state.consider_rotom_talk,
+                state.rotom_threshold_value(),
+                Some(predicted_rotom),
+            )
+            .expect("plan with the Enter-time Rotom prediction");
+        state.target = advance_timeline(
+            config.seed,
+            resolved_plan.encounter_start,
+            config.npc_models,
+            5,
+        )
+        .expect("reachable test Target")
+        .to_string();
+        state.mark_production_preparation_pending();
+        let (stale_request, cache) = state
+            .production_preparation_request()
+            .expect("production request");
+        let stale_prepared =
+            AppState::calculate_production_preparation(stale_request.clone(), cache)
+                .expect("prepared production timeline");
+
+        state.begin_encounter();
+        assert!(state.encounter_start_requested);
+        assert!(state.is_ready());
+        assert!(!state.apply_production_preparation(&stale_request, stale_prepared));
+        assert!(state.production_preparation_pending);
+        assert!(state.encounter_start_requested);
+
+        let (current_request, cache) = state
+            .production_preparation_request()
+            .expect("request with Enter-time Rotom selection");
+        let current_prepared =
+            AppState::calculate_production_preparation(current_request.clone(), cache)
+                .expect("current production timeline");
+
+        assert!(state.apply_production_preparation(&current_request, current_prepared));
+
+        assert!(!state.encounter_start_requested);
+        assert!(state.is_countdown());
     }
 
     #[test]

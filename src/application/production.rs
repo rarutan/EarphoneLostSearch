@@ -3,6 +3,7 @@
 //! ロトム、NPC初期読み込み、オフセットの順序をここで一つの入力へまとめ、
 //! 右上案内・候補判定・タイマーが同じ計算経路を共有できるようにする。
 
+#[cfg(test)]
 use crate::domain::rng::{
     advance_timeline, encounter_plan_with_pre_rotom_consumption, production_timeline,
 };
@@ -31,6 +32,7 @@ pub(crate) const MAX_PRODUCTION_LOOKAHEAD: i64 = 100_000;
 impl ProductionQuery {
     /// B直後の追加消費・ロトム・初期読み込みを反映した本番開始位置。
     /// 最速閉じの指定ステップは、呼び出し側がこの位置から別途進める。
+    #[cfg(test)]
     pub(crate) fn base_encounter_start(self, observed_position: i64) -> Option<i64> {
         encounter_plan_with_pre_rotom_consumption(
             self.seed,
@@ -45,6 +47,7 @@ impl ProductionQuery {
         .map(|plan| plan.encounter_start)
     }
 
+    #[cfg(test)]
     pub(crate) fn encounter_start(self, observed_position: i64) -> Option<i64> {
         let start = self.base_encounter_start(observed_position)?;
         self.fastest_ticks.map_or(Some(start), |ticks| {
@@ -52,6 +55,7 @@ impl ProductionQuery {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn target_reachable(self, observed_position: i64) -> bool {
         if self.target.saturating_sub(observed_position) > MAX_PRODUCTION_LOOKAHEAD {
             return false;

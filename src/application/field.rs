@@ -5,8 +5,12 @@
 
 #[cfg(test)]
 use crate::domain::rng::generate_u64_values_from;
-use crate::domain::rng::{ModelConsumption, ModelStatus, ObservationCache, Sfmt, MAX_SFMT_FRAME};
+use crate::domain::rng::{
+    ModelConsumption, ModelStatus, ObservationCache, Sfmt, MAX_CONSECUTIVE_IDLE_TICKS,
+    MAX_SFMT_FRAME,
+};
 use crate::domain::timing::{game_frames_to_seconds, seconds_to_game_frames};
+use crate::errors::{AppError, AppResult, ArithmeticOperation, CacheError, InputField};
 use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,9 +26,11 @@ pub const MAX_SEARCH_SPAN: i64 = 100_000;
 const MIN_TIMELINE_FRAME: i64 = 477;
 // 1/30秒tickを表示Frameへ直すと2倍になる。検索の先読みは十分な余裕を持たせる。
 const MAX_WAIT_TICKS: i64 = 5_000;
-const MAX_TARGET_TICKS: i64 = 10_000_000;
 /// 一意候補のTimelineを遅延延長する1/30秒単位のチャンクサイズ。
 const TIMELINE_CHUNK_TICKS: i64 = 4_096;
+/// 画面表示用に保持する瞬き行数。乱数状態と観測要約は別に保持するため、
+/// 古い表示行はこの範囲から外れた時点で破棄できる。
+pub(crate) const MAX_RETAINED_TIMELINE_ROWS: usize = 256;
 // 起動直後のTimelineウォームアップは、全検索範囲を先行走査しない。
 // 観測入力までに間に合う小さな先頭チャンクだけを作り、残りは詳細検索へ委ねる。
 #[allow(dead_code)]
@@ -66,15 +72,14 @@ pub const DEFAULT_INITIAL_BRANCH_SCAN_SPAN: i64 = 30;
 pub const INITIAL_BRANCH_SCAN_SPAN: i64 = DEFAULT_INITIAL_BRANCH_SCAN_SPAN;
 /// 初期分岐探索幅として許可する上限。
 pub const MAX_INITIAL_BRANCH_SCAN_SPAN: i64 = 1_000;
-const SEARCH_CANCELLED: &str = "検索をキャンセルしました。";
 
 // ---------------------------------------------------------------------------
 // 検索ドメイン型とTimeline索引の構築
 // ---------------------------------------------------------------------------
 
-fn check_cancelled(cancel: Option<&AtomicBool>) -> Result<(), String> {
+fn check_cancelled(cancel: Option<&AtomicBool>) -> AppResult<()> {
     if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
-        Err(SEARCH_CANCELLED.into())
+        Err(AppError::Cancelled)
     } else {
         Ok(())
     }
@@ -127,8 +132,14 @@ pub struct FieldResult {
     pub models: usize,
     /// 観測後の現在位置から続く瞬きタイムライン。
     pub timeline: Vec<FieldTimelineRow>,
-    /// Targetまでに見込まれる瞬き回数。Target未設定または到達不能ならNone。
+    /// 候補の追加照合に使う内部イベント。画面表示用Timelineとは分離する。
+    candidate_blinks: Vec<CandidateBlink>,
+    /// 最後に観測した瞬きからTargetまでに見込まれる瞬き回数。
+    /// Target未設定または計算範囲外ならNone。
     pub target_blink_count: Option<usize>,
+    /// 表示Timelineの先頭行から最後の観測行までの瞬き行数。
+    /// 行履歴が切り詰められてもTargetまでの回数を表示できるよう保持する。
+    pub(crate) target_blink_count_offset_from_first_row: i64,
     /// Timelineを遅延延長するための継続状態。結果と同じ候補に保持し、チャンク境界で
     /// ModelStatusとremainを初期化し直さない。
     timeline_cursor: Option<TimelineCursor>,
@@ -145,10 +156,17 @@ pub struct FieldTimelineRow {
     pub timeline_frame: i64,
     /// この位置から次の瞬きまでのゲーム内表示Frame。
     pub duration_frames: i64,
+}
+
+/// 候補照合に必要な瞬き情報。表の描画データには渡さない。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CandidateBlink {
+    frame: i64,
+    timeline_frame: i64,
     /// 実測観測ですでに通過した瞬き行。
-    pub observed: bool,
+    observed: bool,
     /// この行の瞬きで観測対象モデルが参照したSFMT位置。
-    pub target_consumption: Option<i64>,
+    target_consumption: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -336,21 +354,21 @@ struct TargetTiming {
 /// 同じ列の該当位置から読む。検索結果は最初の一致だけで打ち切らず、範囲内の
 /// 全開始消費位置を返す。
 #[cfg(test)]
-pub fn search(config: &FieldConfig) -> Result<Vec<FieldResult>, String> {
+pub fn search(config: &FieldConfig) -> Result<Vec<FieldResult>, AppError> {
     let pool = prepare_search_pool(config)?;
     search_with_cache(config, &pool.cache)
 }
 
 /// 観測開始時に先行生成する検索用SFMTプール。
 #[cfg(test)]
-pub(crate) fn prepare_search_pool(config: &FieldConfig) -> Result<FieldSearchPool, String> {
+pub(crate) fn prepare_search_pool(config: &FieldConfig) -> Result<FieldSearchPool, AppError> {
     prepare_search_pool_cancelable(config, None)
 }
 
 fn prepare_search_pool_cancelable(
     config: &FieldConfig,
     cancel: Option<&AtomicBool>,
-) -> Result<FieldSearchPool, String> {
+) -> Result<FieldSearchPool, AppError> {
     validate_static_config(config)?;
     check_cancelled(cancel)?;
     // Target到達判定は候補ごとの保存カーソルから行うため、共有観測キャッシュには
@@ -376,16 +394,16 @@ fn prepare_search_pool_cancelable(
 #[cfg(test)]
 pub(crate) fn prepare_search_pool_with_configs(
     configs: &[FieldConfig],
-) -> Result<FieldSearchPool, String> {
+) -> Result<FieldSearchPool, AppError> {
     prepare_search_pool_with_configs_cancelable(configs, None)
 }
 
 pub(crate) fn prepare_search_pool_with_configs_cancelable(
     configs: &[FieldConfig],
     cancel: Option<&AtomicBool>,
-) -> Result<FieldSearchPool, String> {
+) -> Result<FieldSearchPool, AppError> {
     let Some(first) = configs.first() else {
-        return Err("NPC範囲を確認してください。".into());
+        return Err(AppError::InvalidNpcRange);
     };
     check_cancelled(cancel)?;
     // SFMT列はNPC数に依存せず共有できる。最大モデル数に必要な先読みを一度だけ生成し、
@@ -405,7 +423,7 @@ pub(crate) fn prepare_search_pool_with_configs_cancelable(
 fn prepare_timeline_index(
     cache: &ObservationCache,
     configs: &[FieldConfig],
-) -> Result<PreparedTimelineIndex, String> {
+) -> Result<PreparedTimelineIndex, AppError> {
     prepare_timeline_index_cancelable(cache, configs, None)
 }
 
@@ -415,7 +433,7 @@ pub(crate) fn prepare_timeline_index_cancelable(
     cache: &ObservationCache,
     configs: &[FieldConfig],
     cancel: Option<&AtomicBool>,
-) -> Result<PreparedTimelineIndex, String> {
+) -> Result<PreparedTimelineIndex, AppError> {
     prepare_timeline_index_bounded_cancelable(cache, configs, cancel, MAX_WAIT_TICKS)
 }
 
@@ -429,7 +447,7 @@ pub(crate) fn prepare_timeline_warmup_cancelable(
     cache: &ObservationCache,
     configs: &[FieldConfig],
     cancel: Option<&AtomicBool>,
-) -> Result<PreparedTimelineIndex, String> {
+) -> Result<PreparedTimelineIndex, AppError> {
     let bounded = configs
         .iter()
         .map(|config| {
@@ -450,7 +468,7 @@ fn prepare_timeline_index_bounded_cancelable(
     configs: &[FieldConfig],
     cancel: Option<&AtomicBool>,
     max_wait_ticks: i64,
-) -> Result<PreparedTimelineIndex, String> {
+) -> Result<PreparedTimelineIndex, AppError> {
     let mut entries = Vec::new();
     for config in configs {
         check_cancelled(cancel)?;
@@ -558,7 +576,7 @@ fn prepare_timeline_entry_with_limit(
 /// 呼び出し側が検索対象を切り替える場合は、明示的に別の設定で再検索する。
 #[cfg(test)]
 #[allow(dead_code)]
-pub fn search_with_preferred_idx(config: &FieldConfig) -> Result<FieldSearchOutcome, String> {
+pub fn search_with_preferred_idx(config: &FieldConfig) -> Result<FieldSearchOutcome, AppError> {
     let pool = prepare_search_pool(config)?;
     search_with_preferred_idx_with_pool(config, &pool)
 }
@@ -567,7 +585,7 @@ pub fn search_with_preferred_idx(config: &FieldConfig) -> Result<FieldSearchOutc
 pub(crate) fn search_with_preferred_idx_with_pool(
     config: &FieldConfig,
     pool: &FieldSearchPool,
-) -> Result<FieldSearchOutcome, String> {
+) -> Result<FieldSearchOutcome, AppError> {
     search_with_preferred_idx_with_pool_cancelable(config, pool, None)
 }
 
@@ -576,7 +594,7 @@ fn search_with_preferred_idx_with_pool_cancelable(
     config: &FieldConfig,
     pool: &FieldSearchPool,
     cancel: Option<&AtomicBool>,
-) -> Result<FieldSearchOutcome, String> {
+) -> Result<FieldSearchOutcome, AppError> {
     validate(config)?;
     check_cancelled(cancel)?;
     let prepared = pool.timeline.as_ref().filter(|index| index.covers(config));
@@ -595,7 +613,7 @@ pub(crate) fn search_with_npc_range_with_pool(
     configs: &[FieldConfig],
     pool: &FieldSearchPool,
     target_mode: FieldTargetMode,
-) -> Result<FieldSearchOutcome, String> {
+) -> Result<FieldSearchOutcome, AppError> {
     search_with_npc_range_with_pool_cancelable(configs, pool, target_mode, None)
 }
 
@@ -604,7 +622,7 @@ pub(crate) fn search_with_npc_range_with_pool_cancelable(
     pool: &FieldSearchPool,
     _target_mode: FieldTargetMode,
     cancel: Option<&AtomicBool>,
-) -> Result<FieldSearchOutcome, String> {
+) -> Result<FieldSearchOutcome, AppError> {
     search_with_npc_range_with_pool_cancelable_and_span(
         configs,
         pool,
@@ -621,7 +639,7 @@ pub(crate) fn search_with_npc_range_with_pool_cancelable_and_span(
     _target_mode: FieldTargetMode,
     initial_branch_scan_span: i64,
     cancel: Option<&AtomicBool>,
-) -> Result<FieldSearchOutcome, String> {
+) -> Result<FieldSearchOutcome, AppError> {
     check_cancelled(cancel)?;
     // NPC範囲検索では各モデル数のTimeline照合も互いに独立している。
     // idx不明時のモデル並列化と合わせ、範囲内の設定も並列に処理して
@@ -643,7 +661,7 @@ pub(crate) fn search_with_npc_range_with_pool_cancelable_and_span(
                 fallback_indices: None,
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, AppError>>()?;
     let mut results = Vec::new();
     let mut fallback_indices = Vec::new();
     for outcome in outcomes {
@@ -718,7 +736,7 @@ fn search_v12_with_cache_cancelable_with_span(
     all_models: bool,
     initial_branch_scan_span: i64,
     cancel: Option<&AtomicBool>,
-) -> Result<Vec<FieldResult>, String> {
+) -> Result<Vec<FieldResult>, AppError> {
     validate_static_config(config)?;
     check_cancelled(cancel)?;
     let raw_config = reference_tick_config(config);
@@ -784,8 +802,8 @@ fn search_v12_with_cache_cancelable_with_span(
     // 入力NPC番号へ一致する行を選び、未一致なら代表行を仮表示する。
     let mut targeted = results
         .into_par_iter()
-        .map(|result| apply_target_from_cursor(result, config.seed, target, cancel))
-        .collect::<Vec<_>>();
+        .map(|result| apply_target_from_cursor(result, config.seed, target, Some(cache), cancel))
+        .collect::<AppResult<Vec<_>>>()?;
     targeted.sort_by_key(|result| {
         (
             result.start_consumption,
@@ -1033,7 +1051,7 @@ fn search_v12_start_all_models(
 fn search_with_cache(
     config: &FieldConfig,
     cache: &ObservationCache,
-) -> Result<Vec<FieldResult>, String> {
+) -> Result<Vec<FieldResult>, AppError> {
     search_with_cache_cancelable(config, cache, None)
 }
 
@@ -1042,7 +1060,7 @@ fn search_with_cache_cancelable(
     config: &FieldConfig,
     cache: &ObservationCache,
     cancel: Option<&AtomicBool>,
-) -> Result<Vec<FieldResult>, String> {
+) -> Result<Vec<FieldResult>, AppError> {
     search_with_cache_and_index_cancelable(config, cache, None, cancel)
 }
 
@@ -1051,7 +1069,7 @@ fn search_with_cache_and_index(
     config: &FieldConfig,
     cache: &ObservationCache,
     prepared: Option<&PreparedTimelineIndex>,
-) -> Result<Vec<FieldResult>, String> {
+) -> Result<Vec<FieldResult>, AppError> {
     search_with_cache_and_index_cancelable(config, cache, prepared, None)
 }
 
@@ -1060,7 +1078,7 @@ fn search_with_cache_and_index_cancelable(
     cache: &ObservationCache,
     _prepared: Option<&PreparedTimelineIndex>,
     cancel: Option<&AtomicBool>,
-) -> Result<Vec<FieldResult>, String> {
+) -> Result<Vec<FieldResult>, AppError> {
     validate(config)?;
     check_cancelled(cancel)?;
     // Timeline生成と間隔照合を開始位置ごとに分け、Target到達判定は一致候補へ
@@ -1094,7 +1112,7 @@ fn search_with_cache_and_index_cancelable(
     for (chunk_start, chunk_end) in chunks {
         let chunk_results = {
             if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
-                return Err(SEARCH_CANCELLED.into());
+                return Err(AppError::Cancelled);
             }
             // 間隔照合に必要な最大5000 tick分だけをこのチャンクへ読む。
             let chunk_stream_end = chunk_end
@@ -1105,9 +1123,7 @@ fn search_with_cache_and_index_cancelable(
                 .saturating_sub(chunk_start)
                 .saturating_add(1)
                 .max(0) as usize;
-            let Ok(values) = cache.read_values(chunk_start, count) else {
-                continue;
-            };
+            let values = cache.read_values(chunk_start, count)?;
             let values = SearchValues::new(chunk_start, values);
             // 先に開始位置ごとのTimelineを1回だけ走査し、その結果から
             // 各モデルの瞬き列へ観測間隔を照合する。モデルidxごとに
@@ -1168,8 +1184,8 @@ fn search_with_cache_and_index_cancelable(
     // SFMT後続列を一括で読み込まない。
     let mut targeted = results
         .into_par_iter()
-        .map(|result| apply_target_from_cursor(result, config.seed, target, cancel))
-        .collect::<Vec<_>>();
+        .map(|result| apply_target_from_cursor(result, config.seed, target, Some(cache), cancel))
+        .collect::<AppResult<Vec<_>>>()?;
     targeted.sort_by_key(|result| {
         (
             result.start_consumption,
@@ -1214,7 +1230,7 @@ fn observation_stream_end(config: &FieldConfig) -> i64 {
 /// 各idxを全て仮定して間隔だけを照合する。Target到達判定は、観測対象idxが
 /// 確定していないため行わない。
 #[cfg(test)]
-pub fn search_without_target_model(config: &FieldConfig) -> Result<Vec<FieldResult>, String> {
+pub fn search_without_target_model(config: &FieldConfig) -> Result<Vec<FieldResult>, AppError> {
     let pool = prepare_search_pool(config)?;
     search_without_target_model_with_pool(config, &pool)
 }
@@ -1223,7 +1239,7 @@ pub fn search_without_target_model(config: &FieldConfig) -> Result<Vec<FieldResu
 pub(crate) fn search_without_target_model_with_pool(
     config: &FieldConfig,
     pool: &FieldSearchPool,
-) -> Result<Vec<FieldResult>, String> {
+) -> Result<Vec<FieldResult>, AppError> {
     search_without_target_model_with_pool_cancelable(config, pool, None)
 }
 
@@ -1232,7 +1248,7 @@ fn search_without_target_model_with_pool_cancelable(
     config: &FieldConfig,
     pool: &FieldSearchPool,
     cancel: Option<&AtomicBool>,
-) -> Result<Vec<FieldResult>, String> {
+) -> Result<Vec<FieldResult>, AppError> {
     validate(config)?;
     check_cancelled(cancel)?;
     // idx不明時は、同じ開始位置のModelStatusをidxごとに再初期化せず、
@@ -1254,7 +1270,7 @@ fn search_without_target_model_with_pool_cancelable(
     for (chunk_start, chunk_end) in chunks {
         let chunk_results = {
             if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
-                return Err(SEARCH_CANCELLED.into());
+                return Err(AppError::Cancelled);
             }
             let stream_end = chunk_end
                 .saturating_add(MAX_WAIT_TICKS.saturating_mul(config.models as i64))
@@ -1264,9 +1280,7 @@ fn search_without_target_model_with_pool_cancelable(
                 .saturating_sub(chunk_start)
                 .saturating_add(1)
                 .max(0) as usize;
-            let Ok(values) = pool.cache.read_values(chunk_start, count) else {
-                continue;
-            };
+            let values = pool.cache.read_values(chunk_start, count)?;
             let values = std::sync::Arc::new(SearchValues::new(chunk_start, values));
             (chunk_start..=chunk_end)
                 .into_par_iter()
@@ -1313,7 +1327,7 @@ fn search_with_prefix_filter_cancelable(
     config: &FieldConfig,
     cache: &ObservationCache,
     cancel: Option<&AtomicBool>,
-) -> Result<Vec<FieldResult>, String> {
+) -> Result<Vec<FieldResult>, AppError> {
     if config.observed_intervals.len() < PRECOMPUTED_TIMELINE_EVENTS {
         return search_with_cache_and_index_cancelable(config, cache, None, cancel);
     }
@@ -1337,7 +1351,7 @@ fn search_with_prefix_filter_cancelable(
     for (chunk_start, chunk_end) in chunks {
         let chunk_starts = {
             if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
-                return Err(SEARCH_CANCELLED.into());
+                return Err(AppError::Cancelled);
             }
             let stream_end = chunk_end
                 .saturating_add(MAX_WAIT_TICKS.saturating_mul(config.models as i64))
@@ -1347,9 +1361,7 @@ fn search_with_prefix_filter_cancelable(
                 .saturating_sub(chunk_start)
                 .saturating_add(1)
                 .max(0) as usize;
-            let Ok(values) = cache.read_values(chunk_start, count) else {
-                continue;
-            };
+            let values = cache.read_values(chunk_start, count)?;
             let values = SearchValues::new(chunk_start, values);
             (chunk_start..=chunk_end)
                 .into_par_iter()
@@ -1364,9 +1376,9 @@ fn search_with_prefix_filter_cancelable(
 
     let results = starts
         .into_par_iter()
-        .filter_map(|start_consumption| {
+        .map(|start_consumption| {
             if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
-                return None;
+                return Ok(None);
             }
             let stream_end = start_consumption
                 .saturating_add(MAX_WAIT_TICKS.saturating_mul(config.models as i64))
@@ -1376,11 +1388,19 @@ fn search_with_prefix_filter_cancelable(
                 .saturating_sub(start_consumption)
                 .saturating_add(1)
                 .max(0) as usize;
-            let values = cache.read_values(start_consumption, count).ok()?;
+            let values = cache.read_values(start_consumption, count)?;
             let values = SearchValues::new(start_consumption, values);
-            search_candidate_cancelable(start_consumption, config, &values, cancel)
+            Ok(search_candidate_cancelable(
+                start_consumption,
+                config,
+                &values,
+                cancel,
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, AppError>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     check_cancelled(cancel)?;
     Ok(results)
 }
@@ -1512,7 +1532,7 @@ fn matching_event_windows<'a>(
 /// 呼び出し側へ返す。
 #[cfg(test)]
 #[allow(dead_code)]
-pub fn infer_idx(config: &FieldConfig, actual_frame: i64) -> Result<FieldIdxInference, String> {
+pub fn infer_idx(config: &FieldConfig, actual_frame: i64) -> Result<FieldIdxInference, AppError> {
     infer_idx_cancelable(config, actual_frame, None)
 }
 
@@ -1522,9 +1542,9 @@ fn infer_idx_cancelable(
     config: &FieldConfig,
     actual_frame: i64,
     cancel: Option<&AtomicBool>,
-) -> Result<FieldIdxInference, String> {
+) -> Result<FieldIdxInference, AppError> {
     if actual_frame < 0 {
-        return Err("実際に出たFrameは0以上で入力してください。".into());
+        return Err(AppError::NegativeValue(InputField::ActualFrame));
     }
     check_cancelled(cancel)?;
     let mut results = Vec::new();
@@ -1557,7 +1577,7 @@ fn infer_idx_cancelable(
 pub(crate) fn infer_idx_for_configs(
     configs: &[FieldConfig],
     actual_frame: i64,
-) -> Result<FieldIdxInference, String> {
+) -> Result<FieldIdxInference, AppError> {
     infer_idx_for_configs_cancelable(configs, actual_frame, None)
 }
 
@@ -1567,7 +1587,7 @@ pub(crate) fn infer_idx_for_configs_cancelable(
     configs: &[FieldConfig],
     actual_frame: i64,
     cancel: Option<&AtomicBool>,
-) -> Result<FieldIdxInference, String> {
+) -> Result<FieldIdxInference, AppError> {
     let mut indices = Vec::new();
     let mut results = Vec::new();
     for config in configs {
@@ -1592,15 +1612,16 @@ pub(crate) fn infer_idx_for_configs_cancelable(
 ///
 /// 各idxに対応する開始位置と初期SFMT値を揃え、観測時と本番時で共通の消費ステップを
 /// 使って実測Frameへの到達可否を判定する。
-pub(crate) fn infer_idx_from_result_cancelable(
+pub(crate) fn infer_idx_from_result_with_cache_cancelable(
     seed: u32,
     result: &FieldResult,
     tolerance: i64,
     actual_frame: i64,
+    cache: Option<&ObservationCache>,
     cancel: Option<&AtomicBool>,
-) -> Result<FieldIdxInference, String> {
+) -> Result<FieldIdxInference, AppError> {
     if actual_frame < 0 {
-        return Err("実際に出たFrameは0以上で入力してください。".into());
+        return Err(AppError::NegativeValue(InputField::ActualFrame));
     }
     check_cancelled(cancel)?;
 
@@ -1608,8 +1629,10 @@ pub(crate) fn infer_idx_from_result_cancelable(
     let anchor_position = result
         .start_consumption
         .checked_add(result.observed_model as i64)
-        .ok_or_else(|| "Timelineの開始位置が大きすぎます。".to_string())?;
-    let anchor_value = sfmt_value_at(seed, anchor_position, cancel)?;
+        .ok_or(AppError::ArithmeticOverflow(
+            ArithmeticOperation::TimelinePosition,
+        ))?;
+    let anchor_value = sfmt_value_at_cached(seed, anchor_position, cache, cancel)?;
     let observed_intervals = result.intervals.clone();
     let anchor_start = result.start_consumption;
     let anchor_model = result.observed_model;
@@ -1621,18 +1644,13 @@ pub(crate) fn infer_idx_from_result_cancelable(
         .into_par_iter()
         .filter_map(|candidate_idx| {
             if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
-                return Some(Err(SEARCH_CANCELLED.into()));
+                return Some(Err(AppError::Cancelled));
             }
             let delta = anchor_model as i64 - candidate_idx as i64;
             let candidate_start = anchor_start.saturating_add(delta);
-            let candidate_value = match sfmt_value_at(
-                seed,
-                candidate_start.saturating_add(candidate_idx as i64),
-                cancel,
-            ) {
-                Ok(value) => value,
-                Err(message) => return Some(Err(message)),
-            };
+            // candidate_start + candidate_idxは全候補でanchor_positionと等しい。
+            // 同じ値をSeed先頭から候補ごとに再生成しない。
+            let candidate_value = anchor_value;
             if candidate_value != anchor_value {
                 return None;
             }
@@ -1644,6 +1662,7 @@ pub(crate) fn infer_idx_from_result_cancelable(
                 &observed_intervals,
                 tolerance,
                 actual_frame,
+                cache,
                 cancel,
             ) {
                 Ok(true) => Some(Ok(candidate_idx)),
@@ -1651,7 +1670,7 @@ pub(crate) fn infer_idx_from_result_cancelable(
                 Err(message) => Some(Err(message)),
             }
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, AppError>>()?;
     let mut indices = indices;
     indices.sort_unstable();
     indices.dedup();
@@ -1667,22 +1686,25 @@ pub(crate) fn infer_idx_from_result_cancelable(
 /// Targetと実測FrameはSFMT消費位置、補正値は表示Frameで入力する。可変長の消費を
 /// 単純な数値差と誤認しないよう、同じ連続ModelStatusカーソル上で両位置を解決する。
 /// Timelineの1tickは表示Frameの2Fに相当し、実測がTargetより1tick先なら補正は-2Fとなる。
-pub(crate) fn suggest_field_offset_from_result_cancelable(
+pub(crate) fn suggest_field_offset_from_result_with_cache_cancelable(
     seed: u32,
     result: &FieldResult,
     target: i64,
     actual: i64,
     current_offset: i64,
+    cache: Option<&ObservationCache>,
     cancel: Option<&AtomicBool>,
-) -> Result<Option<i64>, String> {
+) -> Result<Option<i64>, AppError> {
     if target < 0 || actual < 0 {
         return Ok(None);
     }
     check_cancelled(cancel)?;
-    let Some(target_tick) = find_correction_tick_from_cursor(seed, result, target, cancel) else {
+    let Some(target_tick) = find_correction_tick_from_cursor(seed, result, target, cache, cancel)?
+    else {
         return Ok(None);
     };
-    let Some(actual_tick) = find_correction_tick_from_cursor(seed, result, actual, cancel) else {
+    let Some(actual_tick) = find_correction_tick_from_cursor(seed, result, actual, cache, cancel)?
+    else {
         return Ok(None);
     };
     let drift_ticks = actual_tick.saturating_sub(target_tick);
@@ -1691,16 +1713,18 @@ pub(crate) fn suggest_field_offset_from_result_cancelable(
     ))
 }
 
-fn sfmt_value_at(seed: u32, position: i64, cancel: Option<&AtomicBool>) -> Result<u64, String> {
-    if !(0..=MAX_SFMT_FRAME).contains(&position) {
-        return Err("Timelineの開始位置が範囲外です。".into());
-    }
-    let mut sfmt = Sfmt::new(seed);
-    for _ in 0..position {
-        check_cancelled(cancel)?;
-        sfmt.next_u64();
-    }
-    Ok(sfmt.next_u64())
+fn sfmt_value_at_cached(
+    seed: u32,
+    position: i64,
+    cache: Option<&ObservationCache>,
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, AppError> {
+    check_cancelled(cancel)?;
+    let value = match cache.filter(|cache| cache.seed == seed) {
+        Some(cache) => cache.read_values(position, 1)?.first().copied(),
+        None => None,
+    };
+    value.ok_or(AppError::Cache(CacheError::StateUnavailable))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1712,25 +1736,34 @@ fn timeline_reaches_frame(
     observed_intervals: &[i64],
     tolerance: i64,
     actual_frame: i64,
+    cache: Option<&ObservationCache>,
     cancel: Option<&AtomicBool>,
-) -> Result<bool, String> {
-    if start < 0 || actual_frame < start || target_model >= models {
+) -> Result<bool, AppError> {
+    if start < 0 || actual_frame < start || actual_frame > MAX_SFMT_FRAME || target_model >= models
+    {
         return Ok(false);
     }
-    let mut sfmt = Sfmt::new(seed);
-    for _ in 0..start {
-        check_cancelled(cancel)?;
-        sfmt.next_u64();
-    }
+    let Some(mut sfmt) = sfmt_from_cache(seed, start, cache)? else {
+        return Err(AppError::Cache(CacheError::StateUnavailable));
+    };
     let mut status = ModelStatus::new(models);
     let required_events = observed_intervals.len().saturating_add(1);
     let mut blink_frames = Vec::with_capacity(required_events);
     let mut consumption = start;
     let mut tick = 0_i64;
     let mut matched = false;
-    while tick < MAX_TARGET_TICKS && consumption <= actual_frame {
+    let mut idle_ticks = 0_usize;
+    while consumption <= actual_frame {
         check_cancelled(cancel)?;
         let (used, blink) = status.next_state(&mut sfmt);
+        if used == 0 {
+            idle_ticks += 1;
+            if idle_ticks > MAX_CONSECUTIVE_IDLE_TICKS {
+                return Ok(false);
+            }
+        } else {
+            idle_ticks = 0;
+        }
         consumption = consumption.saturating_add(used as i64);
         tick = tick.saturating_add(1);
         if blink.contains(&(target_model as u8)) {
@@ -1757,6 +1790,36 @@ fn timeline_reaches_frame(
         }
     }
     Ok(false)
+}
+
+fn sfmt_from_cache(
+    seed: u32,
+    position: i64,
+    cache: Option<&ObservationCache>,
+) -> AppResult<Option<Sfmt>> {
+    let Some(cache) = cache.filter(|cache| cache.seed == seed) else {
+        return Ok(None);
+    };
+    cache.sfmt_at_checked(position).map_err(AppError::from)
+}
+
+impl FieldResult {
+    /// 保持中の行番号からTargetまでに残る対象NPCの瞬き数を返す。
+    ///
+    /// `target_blink_count`は最後に観測した瞬きが基準で、オフセットにより
+    /// 表示Timelineの先頭行を基準に直す。表示行を間引いても、読み込み済みの
+    /// 行数だけでTargetまでの回数を過少計算しない。
+    pub(crate) fn target_blinks_after_row(&self, row_index: usize) -> Option<usize> {
+        let remaining = i64::try_from(self.target_blink_count?).ok()?;
+        let row_index = i64::try_from(row_index).ok()?;
+        usize::try_from(
+            remaining
+                .checked_add(self.target_blink_count_offset_from_first_row)?
+                .checked_sub(row_index)?
+                .max(0),
+        )
+        .ok()
+    }
 }
 
 #[cfg(test)]
@@ -1909,20 +1972,25 @@ fn result_from_window(
         .and_then(|target| find_target_timing_cancelable(last, target, values, cancel));
     let target_wait_frame =
         target_timing.map(|timing| timing.absolute_wait_frame - last.wait_frame);
-    let (timeline, timeline_cursor, target_cursor) = if materialize_timeline {
+    let (timeline, candidate_blinks, timeline_cursor, target_cursor) = if materialize_timeline {
         let target_cursor = TimelineCursor {
             status: last.status.clone(),
             stream_cursor: last.stream_cursor,
             consumption: last.consumption,
             tick: last.wait_frame / 2,
         };
-        let (timeline, timeline_cursor) = build_timeline(
+        let (timeline, candidate_blinks, timeline_cursor) = build_timeline(
             window,
             target_model,
             target_timing.map(|timing| timing.absolute_wait_frame),
             values,
         );
-        (timeline, timeline_cursor, Some(target_cursor))
+        (
+            timeline,
+            candidate_blinks,
+            timeline_cursor,
+            Some(target_cursor),
+        )
     } else {
         let timeline = window
             .iter()
@@ -1930,6 +1998,13 @@ fn result_from_window(
                 frame: event.consumption,
                 timeline_frame: event.wait_frame,
                 duration_frames: 0,
+            })
+            .collect::<Vec<_>>();
+        let candidate_blinks = window
+            .iter()
+            .map(|event| CandidateBlink {
+                frame: event.consumption,
+                timeline_frame: event.wait_frame,
                 observed: true,
                 target_consumption: event.model_consumption,
             })
@@ -1940,12 +2015,12 @@ fn result_from_window(
             consumption: last.consumption,
             tick: last.wait_frame / 2,
         };
-        (timeline, cursor.clone(), Some(cursor))
+        (timeline, candidate_blinks, cursor.clone(), Some(cursor))
     };
     let target_blink_count = target_timing
         .filter(|_| materialize_timeline)
         .map(|timing| {
-            timeline
+            candidate_blinks
                 .iter()
                 .filter(|row| {
                     row.timeline_frame > last.wait_frame
@@ -1975,7 +2050,9 @@ fn result_from_window(
         observed_model: target_model,
         models: config.models,
         timeline,
+        candidate_blinks,
         target_blink_count,
+        target_blink_count_offset_from_first_row: window.len().saturating_sub(1) as i64,
         timeline_cursor: Some(timeline_cursor),
         target_cursor,
     })
@@ -1986,7 +2063,7 @@ fn build_timeline(
     target_model: usize,
     target_absolute_wait_frame: Option<i64>,
     values: &SearchValues,
-) -> (Vec<FieldTimelineRow>, TimelineCursor) {
+) -> (Vec<FieldTimelineRow>, Vec<CandidateBlink>, TimelineCursor) {
     let event = observed_events
         .last()
         .expect("observed events are non-empty");
@@ -1996,9 +2073,14 @@ fn build_timeline(
     let mut consumption = event.consumption;
     let mut next_events = Vec::new();
 
-    let event_limit = target_absolute_wait_frame
-        .map(|_| usize::MAX)
-        .unwrap_or(MAX_CANDIDATE_TIMELINE_EVENTS);
+    // Targetが遠くても初回表示分だけを先読みする。到達時刻の判定は別の
+    // カーソルで完了しており、表示TimelineをTargetまで展開する必要はない。
+    let display_capacity = MAX_RETAINED_TIMELINE_ROWS.saturating_sub(observed_events.len());
+    let event_limit = if target_absolute_wait_frame.is_some() {
+        display_capacity
+    } else {
+        display_capacity.min(MAX_CANDIDATE_TIMELINE_EVENTS)
+    };
     while tick < MAX_WAIT_TICKS && next_events.len() < event_limit {
         let Some((used, consumed)) =
             next_state_with_positions_values(&mut status, &mut stream_cursor, values)
@@ -2035,9 +2117,24 @@ fn build_timeline(
             (wait_frame, consumption, false, Some(target_consumption))
         },
     ));
-    let mut rows = Vec::with_capacity(all_events.len());
-    for (index, (wait_frame, consumption, observed, target_consumption)) in
-        all_events.iter().copied().enumerate()
+    let first_display_event = all_events.len().saturating_sub(MAX_RETAINED_TIMELINE_ROWS);
+    let candidate_blinks = all_events
+        .iter()
+        .map(
+            |(timeline_frame, frame, observed, target_consumption)| CandidateBlink {
+                frame: *frame,
+                timeline_frame: *timeline_frame,
+                observed: *observed,
+                target_consumption: *target_consumption,
+            },
+        )
+        .collect();
+    let mut rows = Vec::with_capacity(all_events.len().saturating_sub(first_display_event));
+    for (index, (wait_frame, consumption, _, _)) in all_events
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(first_display_event)
     {
         let duration_frames = all_events
             .get(index + 1)
@@ -2047,12 +2144,11 @@ fn build_timeline(
             frame: consumption,
             timeline_frame: wait_frame,
             duration_frames,
-            observed,
-            target_consumption,
         });
     }
     (
         rows,
+        candidate_blinks,
         TimelineCursor {
             status,
             stream_cursor,
@@ -2126,7 +2222,7 @@ fn find_target_timing_cancelable(
     values: &SearchValues,
     cancel: Option<&AtomicBool>,
 ) -> Option<TargetTiming> {
-    if event.consumption > target {
+    if event.consumption > target || target > MAX_SFMT_FRAME {
         return None;
     }
     if event.consumption == target {
@@ -2142,11 +2238,20 @@ fn find_target_timing_cancelable(
     let mut stream_cursor = event.stream_cursor;
     let mut consumption = event.consumption;
     let mut tick = event.wait_frame / 2;
-    while tick < MAX_TARGET_TICKS {
+    let mut idle_ticks = 0_usize;
+    while consumption <= target {
         if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
             return None;
         }
         let (used, _) = next_state_with_values(&mut status, &mut stream_cursor, values)?;
+        if used == 0 {
+            idle_ticks += 1;
+            if idle_ticks > MAX_CONSECUTIVE_IDLE_TICKS {
+                return None;
+            }
+        } else {
+            idle_ticks = 0;
+        }
         let before = consumption;
         consumption += used as i64;
         if before <= target && target < consumption {
@@ -2178,13 +2283,14 @@ fn find_target_timing_from_cursor(
     seed: u32,
     event: &FieldResult,
     target: i64,
+    cache: Option<&ObservationCache>,
     cancel: Option<&AtomicBool>,
-) -> Option<(TargetTiming, usize)> {
-    if event.last_consumption > target {
-        return None;
+) -> AppResult<Option<(TargetTiming, usize)>> {
+    if event.last_consumption > target || target > MAX_SFMT_FRAME {
+        return Ok(None);
     }
     if event.last_consumption == target {
-        return Some((
+        return Ok(Some((
             TargetTiming {
                 absolute_wait_frame: event.last_wait_frame,
                 exact: true,
@@ -2192,33 +2298,45 @@ fn find_target_timing_from_cursor(
                 frame_after: target,
             },
             0,
-        ));
+        )));
     }
     let cursor = event
         .target_cursor
         .as_ref()
-        .or(event.timeline_cursor.as_ref())?;
-    let mut sfmt = Sfmt::new(seed);
-    for _ in 0..cursor.stream_cursor.max(0) {
-        sfmt.next_u64();
-    }
+        .or(event.timeline_cursor.as_ref())
+        .ok_or(AppError::InvalidState(
+            crate::errors::StateIssue::TimelineCursorUnavailable,
+        ))?;
+    let Some(mut sfmt) = sfmt_from_cache(seed, cursor.stream_cursor, cache)? else {
+        return Ok(None);
+    };
     let mut status = cursor.status.clone();
     let mut consumption = event.last_consumption;
     let mut tick = cursor.tick.max(event.last_wait_frame / 2);
     let mut blink_count = 0;
-    while tick < MAX_TARGET_TICKS {
+    let mut idle_ticks = 0_usize;
+    while consumption <= target {
         if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
-            return None;
+            return Err(AppError::Cancelled);
         }
         let (used, blink) = status.next_state(&mut sfmt);
-        let before = consumption;
-        consumption = consumption.checked_add(used as i64)?;
-        tick += 1;
-        if blink.contains(&(event.observed_model as u8)) {
-            blink_count += 1;
+        if used == 0 {
+            idle_ticks += 1;
+            if idle_ticks > MAX_CONSECUTIVE_IDLE_TICKS {
+                return Ok(None);
+            }
+        } else {
+            idle_ticks = 0;
         }
+        let before = consumption;
+        consumption = consumption
+            .checked_add(used as i64)
+            .ok_or(AppError::ArithmeticOverflow(
+                ArithmeticOperation::TimelinePosition,
+            ))?;
+        tick += 1;
         if before <= target && target < consumption {
-            return Some((
+            return Ok(Some((
                 TargetTiming {
                     absolute_wait_frame: tick * 2,
                     exact: false,
@@ -2226,10 +2344,10 @@ fn find_target_timing_from_cursor(
                     frame_after: consumption,
                 },
                 blink_count,
-            ));
+            )));
         }
         if consumption == target {
-            return Some((
+            return Ok(Some((
                 TargetTiming {
                     absolute_wait_frame: tick * 2,
                     exact: true,
@@ -2237,48 +2355,65 @@ fn find_target_timing_from_cursor(
                     frame_after: target,
                 },
                 blink_count,
-            ));
+            )));
+        }
+        if blink.contains(&(event.observed_model as u8)) {
+            blink_count += 1;
         }
     }
-    None
+    Ok(None)
 }
 
-/// 参照ツールと同じ「消費境界を次の遷移時刻で扱う」規則で、補正用のtickを求める。
-/// Targetタイマー本体の厳密着地判定とは独立させ、補正時だけ境界の表示時刻を揃える。
+/// 現在のTimelineカーソルから、指定Frameに初めて到達するtickを求める。
 fn find_correction_tick_from_cursor(
     seed: u32,
     event: &FieldResult,
     target: i64,
+    cache: Option<&ObservationCache>,
     cancel: Option<&AtomicBool>,
-) -> Option<i64> {
-    if event.last_consumption > target {
-        return None;
+) -> AppResult<Option<i64>> {
+    if event.last_consumption > target || target > MAX_SFMT_FRAME {
+        return Ok(None);
     }
     if event.last_consumption == target {
-        return Some(event.last_wait_frame.div_euclid(2));
+        return Ok(Some(event.last_wait_frame.div_euclid(2)));
     }
     let cursor = event
         .target_cursor
         .as_ref()
-        .or(event.timeline_cursor.as_ref())?;
-    let mut sfmt = Sfmt::new(seed);
-    for _ in 0..cursor.stream_cursor.max(0) {
-        sfmt.next_u64();
-    }
+        .or(event.timeline_cursor.as_ref())
+        .ok_or(AppError::InvalidState(
+            crate::errors::StateIssue::TimelineCursorUnavailable,
+        ))?;
+    let Some(mut sfmt) = sfmt_from_cache(seed, cursor.stream_cursor, cache)? else {
+        return Ok(None);
+    };
     let mut status = cursor.status.clone();
     let mut consumption = event.last_consumption;
     let mut tick = cursor.tick.max(event.last_wait_frame / 2);
-    while tick < MAX_TARGET_TICKS {
-        check_cancelled(cancel).ok()?;
-        let before = consumption;
+    let mut idle_ticks = 0_usize;
+    while consumption < target {
+        check_cancelled(cancel)?;
         let (used, _) = status.next_state(&mut sfmt);
-        consumption = consumption.checked_add(used as i64)?;
+        if used == 0 {
+            idle_ticks += 1;
+            if idle_ticks > MAX_CONSECUTIVE_IDLE_TICKS {
+                return Ok(None);
+            }
+        } else {
+            idle_ticks = 0;
+        }
+        consumption = consumption
+            .checked_add(used as i64)
+            .ok_or(AppError::ArithmeticOverflow(
+                ArithmeticOperation::TimelinePosition,
+            ))?;
         tick += 1;
-        if before <= target && target < consumption {
-            return Some(tick);
+        if consumption >= target {
+            return Ok(Some(tick));
         }
     }
-    None
+    Ok(Some(tick))
 }
 
 /// 間隔一致した候補へTarget到達判定を付加する。
@@ -2288,18 +2423,54 @@ fn apply_target_from_cursor(
     mut result: FieldResult,
     seed: u32,
     target: i64,
+    cache: Option<&ObservationCache>,
     cancel: Option<&AtomicBool>,
-) -> FieldResult {
+) -> AppResult<FieldResult> {
     if target < result.start_consumption || target < result.last_consumption {
         result.target_wait_frame = None;
         result.target_exact = Some(false);
         result.target_frame_before = Some(target);
         result.target_frame_after = Some(result.last_consumption);
         result.target_blink_count = None;
-        return result;
+        return Ok(result);
     }
-    let Some((timing, blink_count)) = find_target_timing_from_cursor(seed, &result, target, cancel)
+    let Some((timing, blink_count)) =
+        find_target_timing_from_cursor(seed, &result, target, cache, cancel)?
     else {
+        result.target_wait_frame = None;
+        result.target_exact = Some(false);
+        result.target_frame_before = None;
+        result.target_frame_after = None;
+        result.target_blink_count = None;
+        return Ok(result);
+    };
+    result.target_wait_frame = Some(timing.absolute_wait_frame - result.last_wait_frame);
+    result.target_exact = Some(timing.exact);
+    result.target_frame_before = Some(timing.frame_before);
+    result.target_frame_after = Some(timing.frame_after);
+    result.target_blink_count = Some(blink_count);
+    Ok(result)
+}
+
+/// A confirmed candidate can be evaluated for a new Target without repeating blink matching.
+#[cfg(test)]
+pub(crate) fn retarget_confirmed_result(
+    result: FieldResult,
+    seed: u32,
+    target: i64,
+    cache: &ObservationCache,
+    cancel: Option<&AtomicBool>,
+) -> AppResult<FieldResult> {
+    apply_target_from_cursor(result, seed, target, Some(cache), cancel)
+}
+
+/// Apply a Target query answered by the resolved Timeline's shared progression cache.
+pub(crate) fn apply_cached_target_timing(
+    mut result: FieldResult,
+    target: i64,
+    timing: Option<(i64, bool, i64, i64, usize)>,
+) -> FieldResult {
+    let Some((absolute_wait_frame, exact, frame_before, frame_after, blink_count)) = timing else {
         result.target_wait_frame = None;
         result.target_exact = Some(false);
         result.target_frame_before = None;
@@ -2307,32 +2478,38 @@ fn apply_target_from_cursor(
         result.target_blink_count = None;
         return result;
     };
-    result.target_wait_frame = Some(timing.absolute_wait_frame - result.last_wait_frame);
-    result.target_exact = Some(timing.exact);
-    result.target_frame_before = Some(timing.frame_before);
-    result.target_frame_after = Some(timing.frame_after);
+    result.target_wait_frame = Some(absolute_wait_frame.saturating_sub(result.last_wait_frame));
+    result.target_exact = Some(exact);
+    result.target_frame_before = Some(frame_before);
+    result.target_frame_after = Some(frame_after);
     result.target_blink_count = Some(blink_count);
+    if target < result.last_consumption {
+        result.target_wait_frame = None;
+        result.target_exact = Some(false);
+        result.target_frame_before = Some(target);
+        result.target_frame_after = Some(result.last_consumption);
+        result.target_blink_count = None;
+    }
     result
 }
 
-fn validate(config: &FieldConfig) -> Result<(), String> {
+fn validate(config: &FieldConfig) -> Result<(), AppError> {
     validate_static_config(config)?;
     if config.observed_intervals.is_empty() {
-        return Err("瞬き間隔を1つ以上入力してください。".into());
+        return Err(AppError::MissingObservation);
     }
     if config.observed_intervals.len() >= crate::application::state::MAX_BLINK_OBSERVATIONS {
-        return Err(format!(
-            "瞬き観測は{}回まで入力できます。",
-            crate::application::state::MAX_BLINK_OBSERVATIONS
-        ));
+        return Err(AppError::TooManyObservations {
+            max: crate::application::state::MAX_BLINK_OBSERVATIONS,
+        });
     }
     if config.observed_intervals.iter().any(|value| *value < 0) {
-        return Err("瞬き間隔は0以上の整数で入力してください。".into());
+        return Err(AppError::InvalidObservation);
     }
     Ok(())
 }
 
-fn validate_static_config(config: &FieldConfig) -> Result<(), String> {
+fn validate_static_config(config: &FieldConfig) -> Result<(), AppError> {
     if config.range_start < 0
         || config.range_end < config.range_start
         || config.range_end > MAX_SEARCH_FRAME
@@ -2341,40 +2518,37 @@ fn validate_static_config(config: &FieldConfig) -> Result<(), String> {
         || config.target_model >= config.models
         || config.tolerance < 0
     {
-        return Err(format!(
-            "タイムライン仕様の入力範囲または観測対象を確認してください（消費数範囲は0～{}、モデル数は1～{}）。",
-            MAX_SEARCH_FRAME,
-            MAX_MODELS
-        ));
+        return Err(AppError::InvalidFieldConfiguration);
     }
     if config.range_end.saturating_sub(config.range_start) > MAX_SEARCH_SPAN {
-        return Err(format!(
-            "検索範囲は{}F以内で指定してください。",
-            MAX_SEARCH_SPAN
-        ));
+        return Err(AppError::SearchSpanTooWide {
+            max: MAX_SEARCH_SPAN,
+        });
     }
     if config
         .target_consumption
         .is_some_and(|target| target > MAX_SEARCH_FRAME)
     {
-        return Err(format!(
-            "目標消費数は{}以下で入力してください。",
-            MAX_SEARCH_FRAME
-        ));
+        return Err(AppError::OutOfRange {
+            field: InputField::TargetConsumption,
+            min: 0,
+            max: MAX_SEARCH_FRAME,
+        });
     }
     Ok(())
 }
 
-fn parse_npc_counts(input: &str, multiple: bool) -> Result<Vec<usize>, String> {
+fn parse_npc_counts(input: &str, multiple: bool) -> Result<Vec<usize>, AppError> {
     let value = input.trim();
     if !multiple {
-        let count = usize::try_from(field_state::parse_nonnegative(value, "NPC数")?)
-            .map_err(|_| "NPC数が大きすぎます。".to_string())?;
+        let count = usize::try_from(field_state::parse_nonnegative(value, InputField::NpcCount)?)
+            .map_err(|_| AppError::NpcCountTooLarge)?;
         if count > MAX_NPC_COUNT {
-            return Err(format!(
-                "NPC数は0～{}の範囲で入力してください。",
-                MAX_NPC_COUNT
-            ));
+            return Err(AppError::OutOfRange {
+                field: InputField::NpcCount,
+                min: 0,
+                max: MAX_NPC_COUNT as i64,
+            });
         }
         return Ok(vec![count]);
     }
@@ -2382,33 +2556,31 @@ fn parse_npc_counts(input: &str, multiple: bool) -> Result<Vec<usize>, String> {
     let start = parts
         .next()
         .filter(|part| !part.trim().is_empty())
-        .ok_or_else(|| "NPC範囲は例: 10~20 の形式で入力してください。".to_string())?;
+        .ok_or(AppError::InvalidNpcRange)?;
     let end = parts
         .next()
         .filter(|part| !part.trim().is_empty())
-        .ok_or_else(|| "NPC範囲は例: 10~20 の形式で入力してください。".to_string())?;
+        .ok_or(AppError::InvalidNpcRange)?;
     if parts.next().is_some() {
-        return Err("NPC範囲は例: 10~20 の形式で入力してください。".to_string());
+        return Err(AppError::InvalidNpcRange);
     }
-    let start = usize::try_from(field_state::parse_nonnegative(start, "NPC数")?)
-        .map_err(|_| "NPC数が大きすぎます。".to_string())?;
-    let end = usize::try_from(field_state::parse_nonnegative(end, "NPC数")?)
-        .map_err(|_| "NPC数が大きすぎます。".to_string())?;
+    let start = usize::try_from(field_state::parse_nonnegative(start, InputField::NpcCount)?)
+        .map_err(|_| AppError::NpcCountTooLarge)?;
+    let end = usize::try_from(field_state::parse_nonnegative(end, InputField::NpcCount)?)
+        .map_err(|_| AppError::NpcCountTooLarge)?;
     if start > MAX_NPC_COUNT || end > MAX_NPC_COUNT {
-        return Err(format!(
-            "NPC数は0～{}の範囲で入力してください。",
-            MAX_NPC_COUNT
-        ));
+        return Err(AppError::OutOfRange {
+            field: InputField::NpcCount,
+            min: 0,
+            max: MAX_NPC_COUNT as i64,
+        });
     }
     if end < start {
-        return Err("NPC範囲の終点は始点以上にしてください。".to_string());
+        return Err(AppError::InvalidNpcRange);
     }
     let width = end.saturating_sub(start);
     if width > MAX_NPC_RANGE_WIDTH {
-        return Err(format!(
-            "NPC範囲は幅{}以内で指定してください。",
-            MAX_NPC_RANGE_WIDTH
-        ));
+        return Err(AppError::InvalidNpcRange);
     }
     Ok((start..=end).collect())
 }
@@ -2417,8 +2589,380 @@ fn parse_npc_counts(input: &str, multiple: bool) -> Result<Vec<usize>, String> {
 mod tests {
     use super::*;
 
+    fn target_metrics_from_result(
+        result: &FieldResult,
+        target: i64,
+        values: &SearchValues,
+    ) -> (i64, usize, bool) {
+        let cursor = result.target_cursor.as_ref().unwrap();
+        let mut status = cursor.status.clone();
+        let mut stream_cursor = cursor.stream_cursor;
+        let mut consumption = result.last_consumption;
+        let mut elapsed_ticks = 0_i64;
+        let mut blink_count = 0;
+        while consumption < target {
+            let (used, consumed) =
+                next_state_with_positions_values(&mut status, &mut stream_cursor, values)
+                    .expect("synthetic stream must cover the target");
+            consumption += used as i64;
+            elapsed_ticks += 1;
+            if consumed
+                .iter()
+                .any(|event| event.model == result.observed_model && event.blink)
+            {
+                blink_count += 1;
+            }
+        }
+        (elapsed_ticks * 2, blink_count, consumption == target)
+    }
+
     #[test]
-    fn correction_counts_boundary_from_following_tick() {
+    fn far_field_pattern_at_49m_is_unique_and_reaches_target() {
+        let seed = 0xF4BA_E999;
+        let base = 49_000_000_i64;
+        let range_end = base + 20_000;
+        let models = 16;
+        let target_model = 8;
+        let values = SearchValues::new(
+            base,
+            crate::domain::rng::generate_u64_values_from(seed, base as usize, 1_000_000),
+        );
+        let mut status = ModelStatus::new(models);
+        let mut stream_cursor = base;
+        let mut tick = 0_i64;
+        let mut blink_frames = Vec::new();
+        while blink_frames.len() < 6 {
+            let Some((_, consumed)) =
+                next_state_with_positions_values(&mut status, &mut stream_cursor, &values)
+            else {
+                panic!("synthetic SFMT stream ended before six blinks");
+            };
+            tick += 1;
+            blink_frames.extend(
+                consumed
+                    .into_iter()
+                    .filter(|event| event.model == target_model && event.blink)
+                    .map(|_| tick * 2),
+            );
+        }
+        let intervals = blink_frames
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<Vec<_>>();
+        let mut target_status = status.clone();
+        let mut target_cursor = stream_cursor;
+        let mut target_blinks = 0;
+        for _ in 0..50_000 {
+            let (_, consumed) =
+                next_state_with_positions_values(&mut target_status, &mut target_cursor, &values)
+                    .expect("synthetic SFMT stream must cover the target");
+            if consumed
+                .iter()
+                .any(|event| event.model == target_model && event.blink)
+            {
+                target_blinks += 1;
+            }
+        }
+        let config = FieldConfig {
+            seed,
+            range_start: base,
+            range_end,
+            models,
+            target_model,
+            observed_intervals: intervals.iter().take(2).copied().collect(),
+            tolerance: 15,
+            target_consumption: None,
+        };
+        let raw_config = reference_tick_config(&config);
+        let starts = candidate_start_positions_with_span(
+            base,
+            range_end,
+            DEFAULT_INITIAL_BRANCH_SCAN_SPAN,
+            &values,
+        );
+        let results = starts
+            .iter()
+            .flat_map(|start| {
+                search_v12_start_all_models(
+                    *start,
+                    &raw_config,
+                    &config,
+                    &values,
+                    false,
+                    true,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].start_consumption, base);
+        assert_eq!(results[0].observed_model, target_model);
+        let (wait_frames, target_blink_count, target_exact) =
+            target_metrics_from_result(&results[0], target_cursor, &values);
+        assert_eq!(wait_frames, 101_176);
+        let cursor = results[0].target_cursor.as_ref().unwrap();
+        let event = BlinkEvent {
+            wait_frame: results[0].last_wait_frame,
+            consumption: results[0].last_consumption,
+            status: cursor.status.clone(),
+            stream_cursor: cursor.stream_cursor,
+            model_consumption: results[0].target_consumptions.last().copied(),
+        };
+        let target_timing = find_target_timing_cancelable(&event, target_cursor, &values, None)
+            .expect("target generated from the same timeline must be reachable");
+        assert!(target_exact);
+        assert_eq!(target_timing.exact, target_exact);
+        assert!(target_cursor <= MAX_SFMT_FRAME);
+        assert_eq!(
+            target_timing.absolute_wait_frame - results[0].last_wait_frame,
+            wait_frames
+        );
+        assert!(target_blink_count > 100);
+        assert!(target_blinks > 100);
+    }
+
+    #[test]
+    fn retarget_confirmed_result_keeps_the_observed_timeline() {
+        let seed = 0x8322_38A9;
+        let cursor = TimelineCursor {
+            status: ModelStatus::new(6),
+            stream_cursor: 0,
+            consumption: 0,
+            tick: 0,
+        };
+        let result = FieldResult {
+            start_consumption: 0,
+            first_wait_frame: 0,
+            last_wait_frame: 0,
+            first_consumption: 0,
+            last_consumption: 0,
+            intervals: vec![12, 20],
+            target_consumptions: vec![0, 3, 8],
+            next_blink_wait_frame: 0,
+            target_wait_frame: None,
+            target_exact: None,
+            target_frame_before: None,
+            target_frame_after: None,
+            observed_model: 0,
+            models: 6,
+            timeline: vec![FieldTimelineRow {
+                frame: 8,
+                timeline_frame: 32,
+                duration_frames: 18,
+            }],
+            candidate_blinks: Vec::new(),
+            target_blink_count: None,
+            target_blink_count_offset_from_first_row: 0,
+            timeline_cursor: Some(cursor.clone()),
+            target_cursor: Some(cursor),
+        };
+        let cache = crate::domain::rng::generate_observation_cache(
+            seed,
+            0..=100,
+            0,
+            crate::domain::timing::DEFAULT_FPS,
+        )
+        .unwrap();
+        let original_timeline = result.timeline.clone();
+
+        let retargeted = retarget_confirmed_result(result, seed, 80, &cache, None).unwrap();
+
+        assert_eq!(retargeted.timeline, original_timeline);
+        assert_eq!(retargeted.start_consumption, 0);
+        assert!(retargeted.target_wait_frame.is_some());
+        assert!(retargeted.target_blink_count.is_some());
+    }
+
+    #[test]
+    fn far_field_pattern_reaches_max_frame_without_exact_landing() {
+        let seed = 0x8322_38A9;
+        let base = 49_950_000_i64;
+        let range_end = base + 15_000;
+        let models = 23;
+        let target_model = 22;
+        let values = SearchValues::new(
+            base,
+            crate::domain::rng::generate_u64_values_from(seed, base as usize, 250_000),
+        );
+        let mut status = ModelStatus::new(models);
+        let mut stream_cursor = base;
+        let mut tick = 0_i64;
+        let mut blink_frames = Vec::new();
+        while blink_frames.len() < 6 {
+            let Some((_, consumed)) =
+                next_state_with_positions_values(&mut status, &mut stream_cursor, &values)
+            else {
+                panic!("synthetic SFMT stream ended before six blinks");
+            };
+            tick += 1;
+            blink_frames.extend(
+                consumed
+                    .into_iter()
+                    .filter(|event| event.model == target_model && event.blink)
+                    .map(|_| tick * 2),
+            );
+        }
+        let intervals = blink_frames
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<Vec<_>>();
+        let mut target_status = status.clone();
+        let mut target_cursor = stream_cursor;
+        let mut target_blinks = 0;
+        while target_cursor < MAX_SFMT_FRAME {
+            let (_, consumed) =
+                next_state_with_positions_values(&mut target_status, &mut target_cursor, &values)
+                    .expect("synthetic SFMT stream must cover the target");
+            if consumed
+                .iter()
+                .any(|event| event.model == target_model && event.blink)
+            {
+                target_blinks += 1;
+            }
+        }
+        let config = FieldConfig {
+            seed,
+            range_start: base,
+            range_end,
+            models,
+            target_model,
+            observed_intervals: intervals.iter().take(2).copied().collect(),
+            tolerance: 15,
+            target_consumption: None,
+        };
+        let raw_config = reference_tick_config(&config);
+        let starts = candidate_start_positions_with_span(
+            base,
+            range_end,
+            DEFAULT_INITIAL_BRANCH_SCAN_SPAN,
+            &values,
+        );
+        let results = starts
+            .iter()
+            .flat_map(|start| {
+                search_v12_start_all_models(
+                    *start,
+                    &raw_config,
+                    &config,
+                    &values,
+                    false,
+                    true,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].start_consumption, base);
+        assert_eq!(results[0].observed_model, target_model);
+        let matched_blinks = results[0]
+            .candidate_blinks
+            .iter()
+            .filter(|blink| blink.observed)
+            .map(|blink| blink.timeline_frame)
+            .collect::<Vec<_>>();
+        assert_eq!(matched_blinks, blink_frames[..3]);
+        assert_eq!(
+            matched_blinks
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .collect::<Vec<_>>(),
+            vec![528, 358]
+        );
+        let continuation_cursor = results[0].target_cursor.as_ref().unwrap();
+        let mut continuation_status = continuation_cursor.status.clone();
+        let mut continuation_stream_cursor = continuation_cursor.stream_cursor;
+        let mut continuation_tick = continuation_cursor.tick;
+        let mut direct_following_blinks = Vec::new();
+        while direct_following_blinks.len() < 10 {
+            let Some((_, consumed)) = next_state_with_positions_values(
+                &mut continuation_status,
+                &mut continuation_stream_cursor,
+                &values,
+            ) else {
+                panic!("synthetic SFMT stream ended during post-match continuation");
+            };
+            continuation_tick += 1;
+            if consumed
+                .iter()
+                .any(|event| event.model == target_model && event.blink)
+            {
+                direct_following_blinks.push(continuation_tick * 2);
+            }
+        }
+        let cached_following_blinks = results[0]
+            .candidate_blinks
+            .iter()
+            .filter(|blink| !blink.observed)
+            .take(10)
+            .map(|blink| blink.timeline_frame)
+            .collect::<Vec<_>>();
+        assert_eq!(cached_following_blinks, direct_following_blinks);
+        let mut previous_blink = *matched_blinks.last().unwrap();
+        let following_intervals = cached_following_blinks
+            .iter()
+            .map(|blink_frame| {
+                let interval = *blink_frame - previous_blink;
+                previous_blink = *blink_frame;
+                interval
+            })
+            .collect::<Vec<_>>();
+        println!("case2 intervals after observed blinks (F): {following_intervals:?}");
+        let target_frame = MAX_SFMT_FRAME;
+        let (wait_frames, target_blink_count, target_exact) =
+            target_metrics_from_result(&results[0], target_frame, &values);
+        let cursor = results[0].target_cursor.as_ref().unwrap();
+        let event = BlinkEvent {
+            wait_frame: results[0].last_wait_frame,
+            consumption: results[0].last_consumption,
+            status: cursor.status.clone(),
+            stream_cursor: cursor.stream_cursor,
+            model_consumption: results[0].target_consumptions.last().copied(),
+        };
+        let target_timing = find_target_timing_cancelable(&event, target_frame, &values, None)
+            .expect("target generated from the same timeline must be reachable");
+        assert_eq!(target_timing.exact, target_exact);
+        assert!(!target_exact);
+        assert_eq!(wait_frames, 4_528);
+        assert_eq!(
+            target_timing.absolute_wait_frame - results[0].last_wait_frame,
+            wait_frames
+        );
+        assert!(target_blink_count > 0);
+        assert!(target_blinks > 0);
+        assert_eq!(target_cursor, MAX_SFMT_FRAME + 8);
+    }
+
+    #[test]
+    fn timeline_display_history_is_bounded_without_truncating_candidate_history() {
+        let observed_events = (0..(MAX_RETAINED_TIMELINE_ROWS + 44))
+            .map(|index| BlinkEvent {
+                wait_frame: index as i64 * 2,
+                consumption: index as i64,
+                status: ModelStatus::new(3),
+                stream_cursor: index as i64,
+                model_consumption: Some(index as i64),
+            })
+            .collect::<Vec<_>>();
+        let expected_last = observed_events.last().unwrap().clone();
+        let values = SearchValues::new(0, Vec::new());
+
+        let (rows, candidate_blinks, cursor) =
+            build_timeline(&observed_events, 0, Some(50_000_000), &values);
+
+        assert_eq!(rows.len(), MAX_RETAINED_TIMELINE_ROWS);
+        assert_eq!(
+            rows.first().map(|row| row.timeline_frame),
+            Some(observed_events[44].wait_frame)
+        );
+        assert_eq!(candidate_blinks.len(), observed_events.len());
+        assert_eq!(cursor.status, expected_last.status);
+        assert_eq!(cursor.stream_cursor, expected_last.stream_cursor);
+        assert_eq!(cursor.consumption, expected_last.consumption);
+        assert_eq!(cursor.tick, expected_last.wait_frame / 2);
+    }
+
+    #[test]
+    fn correction_uses_the_timeline_tick_delta_for_frame_boundaries() {
         let cursor = TimelineCursor {
             status: ModelStatus::new(6),
             stream_cursor: 0,
@@ -2441,13 +2985,140 @@ mod tests {
             observed_model: 0,
             models: 6,
             timeline: Vec::new(),
+            candidate_blinks: Vec::new(),
             target_blink_count: None,
+            target_blink_count_offset_from_first_row: 0,
             timeline_cursor: Some(cursor.clone()),
             target_cursor: Some(cursor),
         };
-        let corrected =
-            suggest_field_offset_from_result_cancelable(0, &result, 6, 12, 4, None).unwrap();
+        let cache = crate::domain::rng::generate_observation_cache(
+            0,
+            0..=100,
+            100,
+            crate::domain::timing::DEFAULT_FPS,
+        )
+        .unwrap();
+        let corrected = suggest_field_offset_from_result_with_cache_cancelable(
+            0,
+            &result,
+            6,
+            12,
+            4,
+            Some(&cache),
+            None,
+        )
+        .unwrap();
         assert_eq!(corrected, Some(2));
+    }
+
+    #[test]
+    fn correction_maps_an_exact_consumption_boundary_to_its_reaching_tick() {
+        let seed = 0;
+        let models = 6;
+        let mut status = ModelStatus::new(models);
+        let mut stream_cursor = 0;
+        let values = SearchValues::new(0, crate::domain::rng::generate_u64_values(seed, 100));
+        let (used, _) = next_state_with_positions_values(&mut status, &mut stream_cursor, &values)
+            .expect("the synthetic SFMT range covers the first transition");
+        assert!(used > 0);
+
+        let cursor = TimelineCursor {
+            status: ModelStatus::new(models),
+            stream_cursor: 0,
+            consumption: 0,
+            tick: 0,
+        };
+        let event = FieldResult {
+            start_consumption: 0,
+            first_wait_frame: 0,
+            last_wait_frame: 0,
+            first_consumption: 0,
+            last_consumption: 0,
+            intervals: Vec::new(),
+            target_consumptions: Vec::new(),
+            next_blink_wait_frame: 0,
+            target_wait_frame: None,
+            target_exact: None,
+            target_frame_before: None,
+            target_frame_after: None,
+            observed_model: 0,
+            models,
+            timeline: Vec::new(),
+            candidate_blinks: Vec::new(),
+            target_blink_count: None,
+            target_blink_count_offset_from_first_row: 0,
+            timeline_cursor: Some(cursor.clone()),
+            target_cursor: Some(cursor),
+        };
+        let cache = crate::domain::rng::generate_observation_cache(
+            seed,
+            0..=100,
+            100,
+            crate::domain::timing::DEFAULT_FPS,
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_correction_tick_from_cursor(seed, &event, used as i64, Some(&cache), None)
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn reported_field_offset_case_keeps_the_one_tick_difference() {
+        let seed = 0x7627_5C90;
+        let models = 17;
+        let start = 492;
+        let cursor = TimelineCursor {
+            status: ModelStatus::new(models),
+            stream_cursor: start,
+            consumption: start,
+            tick: 0,
+        };
+        let event = FieldResult {
+            start_consumption: start,
+            first_wait_frame: 0,
+            last_wait_frame: 0,
+            first_consumption: start,
+            last_consumption: start,
+            intervals: Vec::new(),
+            target_consumptions: Vec::new(),
+            next_blink_wait_frame: 0,
+            target_wait_frame: None,
+            target_exact: None,
+            target_frame_before: None,
+            target_frame_after: None,
+            observed_model: 16,
+            models,
+            timeline: Vec::new(),
+            candidate_blinks: Vec::new(),
+            target_blink_count: None,
+            target_blink_count_offset_from_first_row: 0,
+            timeline_cursor: Some(cursor.clone()),
+            target_cursor: Some(cursor),
+        };
+        let cache = crate::domain::rng::generate_observation_cache(
+            seed,
+            0..=112_993,
+            112_993,
+            crate::domain::timing::DEFAULT_FPS,
+        )
+        .unwrap();
+
+        assert_eq!(
+            suggest_field_offset_from_result_with_cache_cancelable(
+                seed,
+                &event,
+                112_993,
+                112_980,
+                0,
+                Some(&cache),
+                None,
+            )
+            .unwrap(),
+            Some(2)
+        );
     }
 
     #[test]
@@ -2572,434 +3243,10 @@ mod tests {
         println!("NPC番号変換の実Timeline検証Seed: {:?}", converted);
     }
 
-    #[test]
-    #[ignore = "1〜6段階後に複数候補が残る実データを探す診断"]
-    fn diagnostic_unresolved_candidates_after_model_resolution() {
-        let base = 480_i64;
-        let mut checked = 0_usize;
-        let mut unresolved = Vec::new();
 
-        'seeds: for seed in 0_u32..500 {
-            for &models in &[5_usize, 10, 13, 20, 22] {
-                let stream_len = models.saturating_mul(280).saturating_add(128);
-                let all_values = generate_u64_values_from(seed, base as usize, stream_len);
-                let starts = candidate_start_positions(
-                    base,
-                    base + 240,
-                    &SearchValues::new(base, all_values[..31].to_vec()),
-                );
-                if starts.len() < 2 {
-                    continue;
-                }
-                let raw_config = FieldConfig {
-                    seed,
-                    range_start: base,
-                    range_end: base + 240,
-                    models,
-                    target_model: 0,
-                    observed_intervals: Vec::new(),
-                    tolerance: 0,
-                    target_consumption: None,
-                };
-                let stream_end = reference_search_stream_end(&raw_config);
-                let values = SearchValues::new(
-                    base,
-                    generate_u64_values_from(
-                        seed,
-                        base as usize,
-                        stream_end.saturating_sub(base).saturating_add(1) as usize,
-                    ),
-                );
-                for target_model in 0..models {
-                    for &source_start in &starts {
-                        let trace = generated_target_trace_with_state(
-                            seed,
-                            source_start,
-                            models,
-                            target_model,
-                            240,
-                        );
-                        if trace.len() < 4 {
-                            continue;
-                        }
-                        let intervals = trace[..4]
-                            .windows(2)
-                            .map(|pair| pair[1].1 - pair[0].1)
-                            .collect::<Vec<_>>();
-                        let mut config = raw_config.clone();
-                        config.target_model = target_model;
-                        config.observed_intervals = intervals.clone();
-                        let converted_config = reference_tick_config(&config);
-                        let mut raw_results = Vec::new();
-                        for &start in &starts {
-                            raw_results.extend(search_v12_start_all_models(
-                                start,
-                                &converted_config,
-                                &config,
-                                &values,
-                                true,
-                                true,
-                                None,
-                            ));
-                        }
-                        let resolved = resolve_observed_model_candidates(
-                            raw_results,
-                            &config,
-                            &converted_config,
-                            &values,
-                            None,
-                        );
-                        let mut keys = resolved
-                            .into_iter()
-                            .filter(|result| result.observed_model == target_model)
-                            .map(|result| {
-                                (
-                                    result.start_consumption,
-                                    result.observed_model,
-                                    result.target_consumptions,
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        keys.sort_by_key(|key| key.0);
-                        keys.dedup();
-                        checked += 1;
-                        if keys.len() > 1 {
-                            unresolved.push((
-                                seed,
-                                models,
-                                target_model,
-                                source_start,
-                                starts.clone(),
-                                keys,
-                            ));
-                            if unresolved.len() >= 5 {
-                                break 'seeds;
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
-        println!("1〜6段階後の未解決候補: checked={checked}, examples={unresolved:#?}");
-        assert!(checked > 0);
-    }
 
-    #[test]
-    #[ignore = "Seed 00000067の分岐候補周辺を比較する診断"]
-    fn diagnostic_seed_00000067_compare_branch_neighbors() {
-        let seed = 103_u32;
-        let models = 5_usize;
-        let target_model = 4_usize;
-        let base = 480_i64;
-        let values = generate_u64_values_from(seed, base as usize, 40);
-        let special = values
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| **value & 0x7f == 0)
-            .map(|(index, value)| (base + index as i64, *value))
-            .collect::<Vec<_>>();
-        println!("seed=00000067 special SFMT positions={special:#?}");
-        for start in [480_i64, 486_i64] {
-            let trace = generated_target_trace_with_state(seed, start, models, target_model, 600);
-            println!(
-                "seed=00000067 start={start} first_events={:#?}",
-                trace.iter().take(8).collect::<Vec<_>>()
-            );
-        }
-        let left = generated_target_trace_with_state(seed, 480, models, target_model, 100_000);
-        let right = generated_target_trace_with_state(seed, 486, models, target_model, 100_000);
-        let first_difference = left
-            .iter()
-            .zip(right.iter())
-            .position(|(left, right)| left.0 != right.0 || left.1 != right.1);
-        println!(
-            "seed=00000067 target4 future: left_events={} right_events={} first_difference={first_difference:?}",
-            left.len(),
-            right.len()
-        );
-        let left_positions = left.iter().map(|event| event.0).collect::<Vec<_>>();
-        let right_positions = right.iter().map(|event| event.0).collect::<Vec<_>>();
-        let first_position_difference_after_two = left_positions
-            .iter()
-            .skip(2)
-            .zip(right_positions.iter().skip(2))
-            .position(|(left, right)| left != right);
-        println!(
-            "seed=00000067 target4 position difference after first 2: {first_position_difference_after_two:?}"
-        );
-    }
 
-    #[test]
-    #[ignore = "正規化後も複数の内部状態候補が残る反例を走査する診断"]
-    fn diagnostic_counterexamples_after_full_state_merge() {
-        let base = 480_i64;
-        let mut checked = 0_usize;
-        let mut unresolved = Vec::new();
-
-        'seeds: for seed in 0_u32..500 {
-            for &models in &[5_usize, 10, 13, 20, 22] {
-                let values = generate_u64_values_from(
-                    seed,
-                    base as usize,
-                    (INITIAL_BRANCH_SCAN_SPAN + 1) as usize,
-                );
-                let starts =
-                    candidate_start_positions(base, base + 240, &SearchValues::new(base, values));
-                if starts.len() < 2 {
-                    continue;
-                }
-                let raw_config = FieldConfig {
-                    seed,
-                    range_start: base,
-                    range_end: base + 240,
-                    models,
-                    target_model: 0,
-                    observed_intervals: Vec::new(),
-                    tolerance: 0,
-                    target_consumption: None,
-                };
-                let stream_end = reference_search_stream_end(&raw_config);
-                let search_values = SearchValues::new(
-                    base,
-                    generate_u64_values_from(
-                        seed,
-                        base as usize,
-                        stream_end.saturating_sub(base).saturating_add(1) as usize,
-                    ),
-                );
-
-                for target_model in 0..models {
-                    for &source_start in &starts {
-                        let trace = generated_target_trace_with_state(
-                            seed,
-                            source_start,
-                            models,
-                            target_model,
-                            240,
-                        );
-                        if trace.len() < 4 {
-                            continue;
-                        }
-                        let intervals = trace[..4]
-                            .windows(2)
-                            .map(|pair| pair[1].1 - pair[0].1)
-                            .collect::<Vec<_>>();
-                        let mut config = raw_config.clone();
-                        config.target_model = target_model;
-                        config.observed_intervals = intervals;
-                        let converted_config = reference_tick_config(&config);
-                        let mut raw_results = Vec::new();
-                        for &start in &starts {
-                            raw_results.extend(search_v12_start_all_models(
-                                start,
-                                &converted_config,
-                                &config,
-                                &search_values,
-                                true,
-                                true,
-                                None,
-                            ));
-                        }
-                        let resolved = resolve_observed_model_candidates(
-                            raw_results,
-                            &config,
-                            &converted_config,
-                            &search_values,
-                            None,
-                        );
-                        let mut state = FieldState::default();
-                        state.target_model = target_model.to_string();
-                        let normalized = state.normalize_search_results(resolved);
-                        checked += 1;
-                        if normalized.len() > 1 {
-                            if seed == 103 && models == 5 && target_model == 4 {
-                                for result in &normalized {
-                                    println!(
-                                        "seed=00000067 normalized start={} cursor={:?}",
-                                        result.start_consumption,
-                                        result
-                                            .target_cursor
-                                            .as_ref()
-                                            .or(result.timeline_cursor.as_ref())
-                                            .map(|cursor| {
-                                                (
-                                                    cursor.stream_cursor,
-                                                    cursor.consumption,
-                                                    cursor.tick,
-                                                    cursor.status.remain.clone(),
-                                                )
-                                            })
-                                    );
-                                }
-                            }
-                            unresolved.push((
-                                seed,
-                                models,
-                                target_model,
-                                source_start,
-                                normalized
-                                    .iter()
-                                    .map(|result| {
-                                        let cursor = result
-                                            .target_cursor
-                                            .as_ref()
-                                            .or(result.timeline_cursor.as_ref())
-                                            .map(|cursor| {
-                                                (
-                                                    cursor.stream_cursor,
-                                                    cursor.consumption,
-                                                    cursor.tick,
-                                                    cursor.status.remain.clone(),
-                                                )
-                                            });
-                                        (
-                                            result.start_consumption,
-                                            result.observed_model,
-                                            result.target_consumptions.clone(),
-                                            cursor,
-                                        )
-                                    })
-                                    .collect::<Vec<_>>(),
-                            ));
-                            if unresolved.len() >= 10 {
-                                break 'seeds;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        println!("正規化後の未解決候補: checked={checked}, examples={unresolved:#?}");
-        assert!(checked > 0);
-    }
-
-    #[test]
-    #[ignore = "同一Start480の別観測窓を追加瞬きで区別できるかの診断"]
-    fn diagnostic_seed_0000019f_same_start_windows_future_disambiguation() {
-        let seed = 415_u32;
-        let models = 22_usize;
-        let target_model = 4_usize;
-        let trace = generated_target_trace_with_state(seed, 480, models, target_model, 20_000);
-        let windows = [[688_i64, 1430, 2269, 3098], [1430_i64, 2269, 3098, 3947]]
-            .into_iter()
-            .map(|positions| {
-                trace
-                    .windows(4)
-                    .find(|window| window.iter().map(|event| event.0).eq(positions.into_iter()))
-                    .map(|window| window.to_vec())
-                    .expect("diagnostic observation window exists")
-            })
-            .collect::<Vec<_>>();
-
-        let futures = windows
-            .iter()
-            .map(|window| continue_target_trace(seed, window.last().unwrap(), target_model, 2_000))
-            .collect::<Vec<_>>();
-        let first_difference = futures[0]
-            .iter()
-            .zip(futures[1].iter())
-            .position(|(left, right)| left != right);
-        println!(
-            "seed=0000019F same-start windows={:?}",
-            windows
-                .iter()
-                .map(|window| {
-                    (
-                        window.iter().map(|event| event.0).collect::<Vec<_>>(),
-                        window.iter().map(|event| event.1).collect::<Vec<_>>(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        );
-        println!(
-            "seed=0000019F future first_difference={first_difference:?} left_len={} right_len={} left_head={:?} right_head={:?}",
-            futures[0].len(),
-            futures[1].len(),
-            futures[0].iter().take(8).collect::<Vec<_>>(),
-            futures[1].iter().take(8).collect::<Vec<_>>(),
-        );
-        assert!(first_difference.is_some());
-    }
-
-    #[test]
-    #[ignore = "正規化後に残る3系列を追加瞬きで区別できるかの診断"]
-    fn diagnostic_remaining_counterexamples_future_disambiguation() {
-        let cases = [
-            (
-                104_u32,
-                10_usize,
-                0_usize,
-                [480_i64, 517_i64],
-                [647_i64, 1434, 1751, 2238],
-                [649_i64, 1434, 1751, 2238],
-            ),
-            (
-                269_u32,
-                20_usize,
-                9_usize,
-                [482_i64, 501_i64],
-                [937_i64, 1741, 2607, 3635],
-                [984_i64, 1741, 2607, 3635],
-            ),
-            (
-                415_u32,
-                13_usize,
-                0_usize,
-                [483_i64, 508_i64],
-                [644_i64, 1215, 1843, 2304],
-                [688_i64, 1215, 1843, 2304],
-            ),
-        ];
-
-        for (seed, models, target_model, starts, left_positions, right_positions) in cases {
-            let traces = starts
-                .into_iter()
-                .map(|start| {
-                    generated_target_trace_with_state(seed, start, models, target_model, 20_000)
-                })
-                .collect::<Vec<_>>();
-            let expected = [left_positions, right_positions];
-            let windows = traces
-                .iter()
-                .zip(expected)
-                .map(|(trace, positions)| {
-                    trace
-                        .windows(4)
-                        .find(|window| window.iter().map(|event| event.0).eq(positions.into_iter()))
-                        .map(|window| window.to_vec())
-                        .expect("diagnostic observation window exists")
-                })
-                .collect::<Vec<_>>();
-            let futures = windows
-                .iter()
-                .map(|window| {
-                    continue_target_trace(seed, window.last().unwrap(), target_model, 100_000)
-                })
-                .collect::<Vec<_>>();
-            let first_difference = futures[0]
-                .iter()
-                .zip(futures[1].iter())
-                .position(|(left, right)| left != right);
-            println!(
-                "seed={seed:08X} models={models} target_model={target_model} windows={:?} future_first_difference={first_difference:?} left_len={} right_len={} left_head={:?} right_head={:?}",
-                windows
-                    .iter()
-                    .map(|window| {
-                        (
-                            window.iter().map(|event| event.0).collect::<Vec<_>>(),
-                            window.iter().map(|event| event.1).collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-                futures[0].len(),
-                futures[1].len(),
-                futures[0].iter().take(6).collect::<Vec<_>>(),
-                futures[1].iter().take(6).collect::<Vec<_>>(),
-            );
-        }
-    }
 
     #[test]
     fn multiple_initial_special_boundaries_keep_all_branch_starts() {
@@ -3045,401 +3292,11 @@ mod tests {
         println!("複数-5分岐の検証Seed: {examples:#?}");
     }
 
-    #[test]
-    #[ignore = "複数-5分岐で同じNPC番号の観測列衝突を探す診断。--ignored で実行"]
-    fn diagnostic_same_idx_distinct_sfmt_sequences() {
-        let base = 480_i64;
-        let models = 13_usize;
-        let required_events = 4_usize;
-        let mut checked_seeds = 0_usize;
-        let mut branch_seed_count = 0_usize;
-        let mut counterexamples = Vec::new();
 
-        'seeds: for seed in 0_u32..50_000 {
-            let values = generate_u64_values_from(
-                seed,
-                base as usize,
-                (INITIAL_BRANCH_SCAN_SPAN + 1) as usize,
-            );
-            let starts =
-                candidate_start_positions(base, base + 100, &SearchValues::new(base, values));
-            if starts.len() < 3 {
-                continue;
-            }
-            branch_seed_count += 1;
-            let traces = starts
-                .iter()
-                .map(|start| generated_target_streams(seed, *start, models, 600))
-                .collect::<Vec<_>>();
-            for left_start in 0..traces.len() {
-                for right_start in (left_start + 1)..traces.len() {
-                    for model in 0..models {
-                        let left = &traces[left_start][model];
-                        let right = &traces[right_start][model];
-                        if left.0.len() < required_events || right.0.len() < required_events {
-                            continue;
-                        }
-                        for left_window in 0..=left.0.len() - required_events {
-                            let left_positions =
-                                &left.0[left_window..left_window + required_events];
-                            let left_waits = &left.1[left_window..left_window + required_events];
-                            let left_intervals = left_waits
-                                .windows(2)
-                                .map(|pair| pair[1] - pair[0])
-                                .collect::<Vec<_>>();
-                            for right_window in 0..=right.0.len() - required_events {
-                                let right_positions =
-                                    &right.0[right_window..right_window + required_events];
-                                let right_waits =
-                                    &right.1[right_window..right_window + required_events];
-                                let right_intervals = right_waits
-                                    .windows(2)
-                                    .map(|pair| pair[1] - pair[0])
-                                    .collect::<Vec<_>>();
-                                if left_intervals == right_intervals
-                                    && left_positions != right_positions
-                                {
-                                    counterexamples.push((
-                                        seed,
-                                        starts[left_start],
-                                        starts[right_start],
-                                        model,
-                                        left_positions.to_vec(),
-                                        right_positions.to_vec(),
-                                        left_intervals.clone(),
-                                    ));
-                                    if counterexamples.len() >= 5 {
-                                        break 'seeds;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            checked_seeds += 1;
-        }
 
-        println!(
-            "同一NPC番号・異なるSFMT列の間隔一致: checked_branch_seeds={branch_seed_count}, counterexamples={counterexamples:#?}"
-        );
-        assert!(checked_seeds > 0 || branch_seed_count > 0);
-        // これは「衝突が存在しない」ことを前提にするテストではない。
-        // 実機入力だけでは区別できない衝突を検出した記録として残す。
-    }
 
-    #[test]
-    #[ignore = "同一NPC番号の衝突候補についてremainとSFMTカーソルを確認する診断"]
-    fn diagnostic_seed_0000123a_compare_remain_after_matching_blinks() {
-        let seed = 0x0000_123a;
-        let models = 13_usize;
-        let target_model = 10_usize;
-        let left = generated_target_trace_with_state(seed, 482, models, target_model, 600);
-        let right = generated_target_trace_with_state(seed, 508, models, target_model, 600);
-        println!("seed=0000123A left_start=482 trace={left:#?}");
-        println!("seed=0000123A right_start=508 trace={right:#?}");
-        assert!(left.len() >= 4 && right.len() >= 4);
-    }
 
-    #[test]
-    #[ignore = "合流前に同じNPC番号の観測列が衝突するケースを走査する診断"]
-    fn diagnostic_post_merge_unresolved_same_model_cases() {
-        let base = 480_i64;
-        let required_events = 4_usize;
-        let model_counts = [5_usize, 10, 13, 20, 22];
-        let mut checked = 0_usize;
-        let mut unresolved = Vec::new();
 
-        'seeds: for seed in 0_u32..10_000 {
-            let values = generate_u64_values_from(
-                seed,
-                base as usize,
-                (INITIAL_BRANCH_SCAN_SPAN + 1) as usize,
-            );
-            let starts =
-                candidate_start_positions(base, base + 100, &SearchValues::new(base, values));
-            if starts.len() < 2 {
-                continue;
-            }
-            checked += 1;
-            for &models in &model_counts {
-                for target_model in 0..models {
-                    let model_traces = starts
-                        .iter()
-                        .enumerate()
-                        .map(|(index, start)| {
-                            (
-                                *start,
-                                generated_target_trace_with_state(
-                                    seed,
-                                    *start,
-                                    models,
-                                    target_model,
-                                    600,
-                                ),
-                                index,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    for left in &model_traces {
-                        if left.1.len() < required_events {
-                            continue;
-                        }
-                        for left_window in left.1.windows(required_events) {
-                            let left_intervals = left_window
-                                .windows(2)
-                                .map(|pair| pair[1].1 - pair[0].1)
-                                .collect::<Vec<_>>();
-                            for right in &model_traces {
-                                if right.0 <= left.0 || right.1.len() < required_events {
-                                    continue;
-                                }
-                                if right.1.windows(required_events).any(|right_window| {
-                                    let right_intervals = right_window
-                                        .windows(2)
-                                        .map(|pair| pair[1].1 - pair[0].1)
-                                        .collect::<Vec<_>>();
-                                    if left_intervals != right_intervals {
-                                        return false;
-                                    }
-                                    let left_state = left_window.last().unwrap();
-                                    let right_state = right_window.last().unwrap();
-                                    left_state.2 != right_state.2 || left_state.3 != right_state.3
-                                }) {
-                                    unresolved.push((
-                                        seed,
-                                        models,
-                                        target_model,
-                                        left.0,
-                                        right.0,
-                                        left_intervals.clone(),
-                                    ));
-                                    if unresolved.len() >= 5 {
-                                        break 'seeds;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        println!(
-            "合流前の同一NPC番号・間隔列衝突: checked_branch_seeds={checked}, examples={unresolved:#?}"
-        );
-        assert!(checked > 0);
-    }
-
-    #[test]
-    #[ignore = "同じNPC番号・同じ間隔列で状態が分かれる具体例の出力"]
-    fn diagnostic_seed_00000024_unresolved_same_model_case() {
-        let seed = 36_u32;
-        let models = 22_usize;
-        let target_model = 8_usize;
-        let base = 480_i64;
-        let values =
-            generate_u64_values_from(seed, base as usize, (INITIAL_BRANCH_SCAN_SPAN + 1) as usize);
-        let starts = candidate_start_positions(base, base + 100, &SearchValues::new(base, values));
-        for start in starts {
-            let trace = generated_target_trace_with_state(seed, start, models, target_model, 600);
-            for window in trace.windows(4) {
-                let intervals = window
-                    .windows(2)
-                    .map(|pair| pair[1].1 - pair[0].1)
-                    .collect::<Vec<_>>();
-                if intervals == [98, 114, 76] {
-                    let last = window.last().unwrap();
-                    println!(
-                        "seed=00000024 models=22 idx=8 start={start} positions={:?} waits={:?} cursor={} remain={:?}",
-                        window.iter().map(|event| event.0).collect::<Vec<_>>(),
-                        window.iter().map(|event| event.1).collect::<Vec<_>>(),
-                        last.2,
-                        last.3,
-                    );
-                }
-            }
-        }
-
-        let left = generated_target_trace_with_state(seed, 480, models, target_model, 600);
-        let right = generated_target_trace_with_state(seed, 491, models, target_model, 600);
-        let left_window = left
-            .windows(4)
-            .find(|window| {
-                window
-                    .windows(2)
-                    .map(|pair| pair[1].1 - pair[0].1)
-                    .collect::<Vec<_>>()
-                    == [98, 114, 76]
-            })
-            .unwrap();
-        let right_window = right
-            .windows(4)
-            .find(|window| {
-                window
-                    .windows(2)
-                    .map(|pair| pair[1].1 - pair[0].1)
-                    .collect::<Vec<_>>()
-                    == [98, 114, 76]
-            })
-            .unwrap();
-        let left_future =
-            continue_target_trace(seed, left_window.last().unwrap(), target_model, 100_000);
-        let right_future =
-            continue_target_trace(seed, right_window.last().unwrap(), target_model, 100_000);
-        let first_difference = left_future
-            .iter()
-            .zip(right_future.iter())
-            .position(|(left, right)| left != right);
-        println!(
-            "seed=00000024 future target events: left={} right={} first_difference={first_difference:?}",
-            left_future.len(),
-            right_future.len(),
-        );
-    }
-
-    #[test]
-    #[ignore = "開始480/491からSFMT5122までの消費経路を確認する診断"]
-    fn diagnostic_seed_00000024_flow_to_sfmt_5122() {
-        for start in [480_i64, 491_i64] {
-            let values = generate_u64_values_from(36, start as usize, 8_000);
-            let mut status = ModelStatus::new(22);
-            let mut stream_cursor = start;
-            let mut value_index = 0;
-            let mut special_count = 0;
-            let mut target_blink_count = 0;
-            println!("start={start}");
-            for tick in 1..=1_000 {
-                let before_cursor = stream_cursor;
-                let (_used, consumed) = status.next_state_with_positions(|| {
-                    let position = stream_cursor;
-                    let value = values[value_index];
-                    value_index += 1;
-                    stream_cursor += 1;
-                    (position, value)
-                });
-                let special = consumed
-                    .iter()
-                    .filter(|event| !event.blink && event.value & 0x7f == 0)
-                    .map(|event| (event.model, event.position))
-                    .collect::<Vec<_>>();
-                let target_blinks = consumed
-                    .iter()
-                    .filter(|event| event.model == 8 && event.blink)
-                    .map(|event| event.position)
-                    .collect::<Vec<_>>();
-                if !special.is_empty() {
-                    special_count += special.len();
-                }
-                if !target_blinks.is_empty() {
-                    target_blink_count += target_blinks.len();
-                }
-                if !special.is_empty() || !target_blinks.is_empty() {
-                    println!(
-                        "  tick={tick:>3} cursor={before_cursor}->{stream_cursor} special_models={special:?} target8_blinks={target_blinks:?} remain8={} total_special={special_count} target8_count={target_blink_count}",
-                        status.remain[8]
-                    );
-                }
-                if target_blinks.iter().any(|position| *position >= 5_122) {
-                    println!("  reached target SFMT 5122 at tick={tick}");
-                    break;
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "同じNPC番号・同じSFMTカーソル・対象remain一致でも将来分岐するかの診断"]
-    fn diagnostic_same_target_state_but_other_models_diverge() {
-        let base = 480_i64;
-        let required_events = 4_usize;
-        let model_counts = [5_usize, 10, 13, 20, 22];
-        let mut checked = 0_usize;
-        let mut examples = Vec::new();
-
-        'seeds: for seed in 0_u32..500 {
-            let values = generate_u64_values_from(
-                seed,
-                base as usize,
-                (INITIAL_BRANCH_SCAN_SPAN + 1) as usize,
-            );
-            let starts =
-                candidate_start_positions(base, base + 100, &SearchValues::new(base, values));
-            if starts.len() < 2 {
-                continue;
-            }
-            checked += 1;
-            for &models in &model_counts {
-                for target_model in 0..models {
-                    let traces = starts
-                        .iter()
-                        .map(|start| {
-                            generated_target_trace_with_state(
-                                seed,
-                                *start,
-                                models,
-                                target_model,
-                                600,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    for left_index in 0..traces.len() {
-                        for right_index in (left_index + 1)..traces.len() {
-                            for left_window in traces[left_index].windows(required_events) {
-                                let left_intervals = left_window
-                                    .windows(2)
-                                    .map(|pair| pair[1].1 - pair[0].1)
-                                    .collect::<Vec<_>>();
-                                let left_last = left_window.last().unwrap();
-                                for right_window in traces[right_index].windows(required_events) {
-                                    let right_intervals = right_window
-                                        .windows(2)
-                                        .map(|pair| pair[1].1 - pair[0].1)
-                                        .collect::<Vec<_>>();
-                                    let right_last = right_window.last().unwrap();
-                                    if left_intervals != right_intervals
-                                        || left_last.2 != right_last.2
-                                        || left_last.3[target_model] != right_last.3[target_model]
-                                        || left_last.3 == right_last.3
-                                    {
-                                        continue;
-                                    }
-                                    let left_future =
-                                        continue_target_trace(seed, left_last, target_model, 5_000);
-                                    let right_future = continue_target_trace(
-                                        seed,
-                                        right_last,
-                                        target_model,
-                                        5_000,
-                                    );
-                                    if left_future != right_future {
-                                        examples.push((
-                                            seed,
-                                            models,
-                                            target_model,
-                                            starts[left_index],
-                                            starts[right_index],
-                                            left_intervals.clone(),
-                                            left_future.len(),
-                                            right_future.len(),
-                                        ));
-                                        if examples.len() >= 5 {
-                                            break 'seeds;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        println!(
-            "同一対象モデル状態からの将来分岐: checked_branch_seeds={checked}, examples={examples:#?}"
-        );
-        assert!(checked > 0);
-    }
 
     fn synthetic_result(
         start_consumption: i64,
@@ -3463,7 +3320,9 @@ mod tests {
             observed_model,
             models: 13,
             timeline: Vec::new(),
+            candidate_blinks: Vec::new(),
             target_blink_count: None,
+            target_blink_count_offset_from_first_row: 0,
             timeline_cursor: None,
             target_cursor: None,
         }
@@ -3519,85 +3378,6 @@ mod tests {
             }
         }
         streams
-    }
-
-    fn generated_target_trace_with_state(
-        seed: u32,
-        start_consumption: i64,
-        models: usize,
-        target_model: usize,
-        ticks: usize,
-    ) -> Vec<(i64, i64, i64, Vec<i32>)> {
-        let values = generate_u64_values_from(
-            seed,
-            start_consumption as usize,
-            models.saturating_mul(ticks).saturating_add(64),
-        );
-        let mut status = ModelStatus::new(models);
-        let mut stream_cursor = start_consumption;
-        let mut value_index = 0;
-        let mut trace = Vec::new();
-        for tick in 1..=ticks {
-            let (_used, consumed) = status.next_state_with_positions(|| {
-                let position = stream_cursor;
-                let value = values[value_index];
-                value_index += 1;
-                stream_cursor += 1;
-                (position, value)
-            });
-            if consumed
-                .iter()
-                .any(|event| event.model == target_model && event.blink)
-            {
-                trace.push((
-                    consumed
-                        .iter()
-                        .find(|event| event.model == target_model && event.blink)
-                        .map(|event| event.position)
-                        .unwrap(),
-                    tick as i64 * 2,
-                    stream_cursor,
-                    status.remain.clone(),
-                ));
-            }
-        }
-        trace
-    }
-
-    fn continue_target_trace(
-        seed: u32,
-        last_event: &(i64, i64, i64, Vec<i32>),
-        target_model: usize,
-        ticks: usize,
-    ) -> Vec<(i64, i64)> {
-        let models = last_event.3.len();
-        let values = generate_u64_values_from(
-            seed,
-            last_event.2 as usize,
-            models.saturating_mul(ticks).saturating_add(64),
-        );
-        let mut status = ModelStatus {
-            remain: last_event.3.clone(),
-        };
-        let mut stream_cursor = last_event.2;
-        let mut value_index = 0;
-        let mut trace = Vec::new();
-        for tick in 1..=ticks {
-            let (_used, consumed) = status.next_state_with_positions(|| {
-                let position = stream_cursor;
-                let value = values[value_index];
-                value_index += 1;
-                stream_cursor += 1;
-                (position, value)
-            });
-            if let Some(event) = consumed
-                .into_iter()
-                .find(|event| event.model == target_model && event.blink)
-            {
-                trace.push((event.position, tick as i64 * 2));
-            }
-        }
-        trace
     }
 
     #[test]

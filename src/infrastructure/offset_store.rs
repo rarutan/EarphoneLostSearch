@@ -2,6 +2,7 @@
 //!
 //! 保存先とシリアライズ形式を管理し、補正値の解釈や丸めは呼び出し側へ委ねる。
 
+use crate::errors::{AppError, AppResult, PersistenceError};
 use crate::infrastructure::settings_store::app_file;
 use serde::{Deserialize, Serialize};
 
@@ -35,15 +36,16 @@ impl OffsetStore {
             .unwrap_or_default()
     }
 
-    pub fn save(&self) -> Result<(), String> {
+    pub fn save(&self) -> AppResult<()> {
         let path = app_file("offsets.json")
-            .ok_or_else(|| "オフセット保存先を決められません。".to_string())?;
+            .ok_or(AppError::Persistence(PersistenceError::PathUnavailable))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|_| "オフセット保存用フォルダを作成できません。".to_string())?;
+                .map_err(|error| AppError::Persistence(PersistenceError::CreateDirectory(error)))?;
         }
         let text = serde_json::to_string_pretty(self)
-            .map_err(|_| "オフセットを保存用JSONへ変換できません。".to_string())?;
-        std::fs::write(path, text).map_err(|_| "オフセットを保存できません。".to_string())
+            .map_err(|error| AppError::Persistence(PersistenceError::Serialize(error)))?;
+        std::fs::write(path, text)
+            .map_err(|error| AppError::Persistence(PersistenceError::Write(error)))
     }
 }
