@@ -157,7 +157,7 @@ SFMTの絶対位置は最大5,000万Frameまで扱えます。ただし、各タ
 
 ## 6. ライセンス
 
-MIT Licenseです。詳細は[LICENSE](LICENSE)を参照してください。
+MIT Licenseです。詳細は[LICENSE](https://github.com/rarutan/EarphoneLostSearch/blob/main/LICENSE)を参照してください。
 
 ## 7. 免責事項
 
