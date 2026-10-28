@@ -16,6 +16,7 @@ jobs:
   build:
     if: github.ref == 'refs/heads/main'
     name: Build ${{ matrix.asset }}
+    timeout-minutes: 15
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -47,6 +48,18 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies and build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
@@ -93,6 +106,7 @@ jobs:
   publish:
     if: github.ref == 'refs/heads/main'
     name: Publish prerelease
+    timeout-minutes: 5
     needs: build
     runs-on: ubuntu-latest
     permissions:
