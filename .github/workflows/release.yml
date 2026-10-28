@@ -1,0 +1,119 @@
+name: Publish release packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Version tag to create (must match Cargo.toml)"
+        required: true
+        default: "v0.3.0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            asset: windows-x64
+            executable: EarphoneLostSearch.exe
+          - runner: ubuntu-24.04
+            asset: linux-x64
+            executable: EarphoneLostSearch
+          - runner: macos-15-intel
+            asset: macos-x64
+            executable: EarphoneLostSearch
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v5
+
+      - name: Validate release version and source branch
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "Release workflow must be run from main."; exit 1; }
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid release tag: $RELEASE_TAG"; exit 1; }
+          PACKAGE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          [[ "$RELEASE_TAG" == "v$PACKAGE_VERSION" ]] || { echo "$RELEASE_TAG does not match Cargo.toml version $PACKAGE_VERSION"; exit 1; }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev
+
+      - name: Run tests
+        run: cargo test --release --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package Unix release
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ASSET_NAME: EarphoneLostSearch-${{ inputs.release_tag }}-${{ matrix.asset }}.zip
+          EXECUTABLE_NAME: ${{ matrix.executable }}
+        run: |
+          mkdir -p package/licenses
+          cp "target/release/$EXECUTABLE_NAME" package/
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md package/
+          cp assets/text/3DSRNGTool-LICENSE.txt package/licenses/
+          (cd package && zip -r "$GITHUB_WORKSPACE/$ASSET_NAME" .)
+
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ASSET_NAME: EarphoneLostSearch-${{ inputs.release_tag }}-${{ matrix.asset }}.zip
+          EXECUTABLE_NAME: ${{ matrix.executable }}
+        run: |
+          New-Item -ItemType Directory -Path package/licenses -Force | Out-Null
+          Copy-Item "target/release/$env:EXECUTABLE_NAME" package/
+          Copy-Item README.md, LICENSE, THIRD_PARTY_NOTICES.md package/
+          Copy-Item assets/text/3DSRNGTool-LICENSE.txt package/licenses/
+          Compress-Archive -Path package/* -DestinationPath "$env:GITHUB_WORKSPACE/$env:ASSET_NAME"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.asset }}
+          path: EarphoneLostSearch-${{ inputs.release_tag }}-${{ matrix.asset }}.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: github.ref == 'refs/heads/main'
+    name: Publish prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release create "$RELEASE_TAG" artifacts/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "EarphoneLostSearch $RELEASE_TAG" \
+            --notes "Prerelease for Windows, Linux, and macOS x64. Each ZIP includes the application, README, MIT license, and third-party license notices." \
+            --prerelease
