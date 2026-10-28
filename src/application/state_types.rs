@@ -54,6 +54,40 @@ pub struct GuidanceSearchRequest {
     pub fastest_ticks: Option<i64>,
 }
 
+/// Target待ち時間の正確なfallbackをworkerへ渡す不変スナップショット。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NormalTargetWaitKey {
+    pub session_generation: u64,
+    pub seed: u32,
+    pub position: i64,
+    pub encounter_start: i64,
+    pub target: i64,
+    pub models: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormalTargetWaitRequest {
+    pub key: NormalTargetWaitKey,
+}
+
+/// 候補到達snapshotを作り直す必要があるか判定する、候補Vecを含まない軽量key。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CandidateReachabilityKey {
+    pub session_generation: u64,
+    pub candidate_generation: u64,
+    pub selected_candidate: usize,
+    pub selected_position: i64,
+    pub seed: u32,
+    pub target: i64,
+    pub models: usize,
+    pub offset: i64,
+    pub consider_rotom: bool,
+    pub rotom_threshold: u64,
+    pub pre_rotom_consumption: i64,
+    pub npc_initial_load: i64,
+    pub fastest_ticks: Option<i64>,
+}
+
 /// 候補ごとの本番Target到達判定をUIスレッドから切り離すための入力。
 /// 選択中候補のタイマー用TimelineはAppState側で保持し、その他の候補は
 /// このスナップショットをワーカースレッドでまとめて判定する。

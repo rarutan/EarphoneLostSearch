@@ -482,6 +482,28 @@ pub(crate) fn npc_spinner(
     changed
 }
 
+/// 保証V数用の上下スピナー。保証できる個体値の数は0～6に制限する。
+pub(crate) fn iv_count_spinner(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    width: f32,
+    wheel_enabled: bool,
+) -> bool {
+    let original = value.clone();
+    let changed = frame_spinner(ui, value, width, 1, wheel_enabled);
+    let trimmed = value.trim();
+    let invalid = !trimmed.is_empty()
+        && trimmed
+            .parse::<i64>()
+            .map(|number| !(0..=6).contains(&number))
+            .unwrap_or(true);
+    if changed && invalid {
+        *value = original;
+        return false;
+    }
+    changed
+}
+
 /// 消費数用の上下スピナー。NPC数とは異なり、補正消費は50を上限にせず
 /// SFMT位置の上限まで入力できる。
 pub(crate) fn consumption_spinner(
@@ -661,6 +683,40 @@ pub(crate) fn numeric_text_edit(
     response
 }
 
+pub(crate) fn bounded_integer_text_edit(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    width: f32,
+    min: i64,
+    max: i64,
+) -> egui::Response {
+    let original = value.clone();
+    let mut edited = original.clone();
+    let mut response = ui.add(
+        egui::TextEdit::singleline(&mut edited)
+            .id_salt(value as *const String)
+            .desired_width(width)
+            .horizontal_align(egui::Align::Max),
+    );
+    if response.changed() {
+        let valid = is_within_integer_range(&edited, min, max);
+        if valid {
+            *value = edited;
+        } else {
+            *value = original;
+            response.changed = false;
+        }
+    }
+    response
+}
+
+fn is_within_integer_range(value: &str, min: i64, max: i64) -> bool {
+    value.is_empty()
+        || value
+            .parse::<i64>()
+            .is_ok_and(|number| (min..=max).contains(&number))
+}
+
 fn is_valid_numeric_text(value: &str, allow_decimal: bool, allow_range: bool) -> bool {
     let mut decimal_seen = false;
     let mut range_seen = false;
@@ -750,7 +806,153 @@ pub(crate) fn install_japanese_font(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_color_scheme, ColorScheme};
+    use super::{
+        apply_color_scheme, fixed_group_panel, is_within_integer_range, npc_spinner, ColorScheme,
+    };
+
+    #[test]
+    fn npc_spinner_step_button_changes_value_and_respects_disabled_state() {
+        let context = eframe::egui::Context::default();
+        let screen_rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::Pos2::ZERO,
+            eframe::egui::vec2(360.0, 120.0),
+        );
+        let mut value = "0".to_owned();
+        let mut widget_origin = eframe::egui::Pos2::ZERO;
+        let input = eframe::egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        };
+        let _ = context.run(input, |context| {
+            eframe::egui::CentralPanel::default()
+                .frame(eframe::egui::Frame::none())
+                .show(context, |ui| {
+                    widget_origin = ui.cursor().min;
+                    npc_spinner(ui, &mut value, 120.0, false);
+                });
+        });
+        let stepper_up = widget_origin + eframe::egui::vec2(128.0, 8.0);
+        let input = eframe::egui::RawInput {
+            screen_rect: Some(screen_rect),
+            events: vec![
+                eframe::egui::Event::PointerMoved(stepper_up),
+                eframe::egui::Event::PointerButton {
+                    pos: stepper_up,
+                    button: eframe::egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: eframe::egui::Modifiers::default(),
+                },
+                eframe::egui::Event::PointerButton {
+                    pos: stepper_up,
+                    button: eframe::egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: eframe::egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = context.run(input, |context| {
+            eframe::egui::CentralPanel::default()
+                .frame(eframe::egui::Frame::none())
+                .show(context, |ui| {
+                    npc_spinner(ui, &mut value, 120.0, false);
+                });
+        });
+        assert_eq!(
+            value, "1",
+            "the enabled stepper increments the Hatch NPC input"
+        );
+
+        value = "13".into();
+        let input = eframe::egui::RawInput {
+            screen_rect: Some(screen_rect),
+            events: vec![
+                eframe::egui::Event::PointerMoved(stepper_up),
+                eframe::egui::Event::PointerButton {
+                    pos: stepper_up,
+                    button: eframe::egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: eframe::egui::Modifiers::default(),
+                },
+                eframe::egui::Event::PointerButton {
+                    pos: stepper_up,
+                    button: eframe::egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: eframe::egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = context.run(input, |context| {
+            eframe::egui::CentralPanel::default()
+                .frame(eframe::egui::Frame::none())
+                .show(context, |ui| {
+                    ui.add_enabled_ui(false, |ui| {
+                        npc_spinner(ui, &mut value, 120.0, false);
+                    });
+                });
+        });
+        assert_eq!(value, "13", "the same input remains locked outside Idle");
+    }
+
+    #[test]
+    fn fixed_group_panel_preserves_parent_rect_and_bounds_child_widgets() {
+        let context = eframe::egui::Context::default();
+
+        for (width, height) in [(420.0, 180.0), (1_052.0, 700.0), (1_600.0, 900.0)] {
+            let mut assigned = eframe::egui::Rect::NOTHING;
+            let mut inner = eframe::egui::Rect::NOTHING;
+            let mut button = eframe::egui::Rect::NOTHING;
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(width, height),
+                )),
+                ..Default::default()
+            };
+
+            let _ = context.run(input, |context| {
+                eframe::egui::CentralPanel::default().show(context, |ui| {
+                    let parent = ui.max_rect();
+                    assigned = eframe::egui::Rect::from_min_size(
+                        parent.min,
+                        eframe::egui::vec2(parent.width(), parent.height()),
+                    );
+                    ui.allocate_new_ui(eframe::egui::UiBuilder::new().max_rect(assigned), |ui| {
+                        fixed_group_panel(ui, |ui| {
+                            inner = ui.max_rect();
+                            button = ui
+                                .add_sized(
+                                    [ui.available_width().min(240.0), 28.0],
+                                    eframe::egui::Button::new("bounded action"),
+                                )
+                                .rect;
+                        });
+                    });
+                });
+            });
+
+            assert!((inner.left() - assigned.left()).is_sign_positive());
+            assert!((inner.top() - assigned.top()).is_sign_positive());
+            assert!(inner.right() < assigned.right());
+            assert!(inner.bottom() < assigned.bottom());
+            assert!(button.left() >= inner.left() - 0.5);
+            assert!(button.right() <= inner.right() + 0.5);
+            assert!(button.top() >= inner.top() - 0.5);
+            assert!(button.bottom() <= inner.bottom() + 0.5);
+        }
+    }
+
+    #[test]
+    fn bounded_integer_input_accepts_only_the_inclusive_range() {
+        assert!(is_within_integer_range("0", 0, 9998));
+        assert!(is_within_integer_range("9998", 0, 9998));
+        assert!(is_within_integer_range("151", 0, 9998));
+        assert!(is_within_integer_range("", 0, 9998));
+        assert!(!is_within_integer_range("-1", 0, 9998));
+        assert!(!is_within_integer_range("9999", 0, 9998));
+        assert!(!is_within_integer_range("1.5", 0, 9998));
+    }
 
     #[test]
     fn changing_color_scheme_preserves_layout_and_text_sizes() {

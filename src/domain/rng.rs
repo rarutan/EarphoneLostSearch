@@ -198,7 +198,7 @@ pub(crate) fn generate_u64_values_from(seed: u32, start: usize, count: usize) ->
 // ModelStatusとTimelineの状態遷移
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ModelStatus {
     pub remain: Vec<i32>,
 }
@@ -302,6 +302,110 @@ impl ModelStatus {
             });
         }
         (used, consumed)
+    }
+
+    /// 有効モデルのprefixだけを進め、各乱数消費をobserverへ渡す。
+    /// 消費ごとの中間Vecは保持せず、戻り値には瞬きしたモデル番号だけを含める。
+    pub(crate) fn next_state_prefix_with_observer<F, O>(
+        &mut self,
+        active_models: usize,
+        next: F,
+        observe: O,
+    ) -> (usize, Vec<u8>)
+    where
+        F: FnMut() -> (i64, u64),
+        O: FnMut(ModelConsumption, i32),
+    {
+        let mut blinks = Vec::new();
+        let used = self.next_state_prefix_core(active_models, next, observe, |model| {
+            blinks.push(model as u8)
+        });
+        (used, blinks)
+    }
+
+    /// Advance the model prefix and report RNG draws without allocating the
+    /// blink-index list when the caller only needs the continuation state.
+    pub(crate) fn next_state_prefix_with_observer_without_blink_list<F, O>(
+        &mut self,
+        active_models: usize,
+        next: F,
+        observe: O,
+    ) -> usize
+    where
+        F: FnMut() -> (i64, u64),
+        O: FnMut(ModelConsumption, i32),
+    {
+        self.next_state_prefix_core(active_models, next, observe, |_| {})
+    }
+
+    /// Advance model state without building the blink-index Vec when the caller
+    /// only needs the resulting RNG position and cooldowns.
+    pub(crate) fn next_state_prefix_without_blink_list<F>(
+        &mut self,
+        active_models: usize,
+        mut next: F,
+    ) -> usize
+    where
+        F: FnMut() -> u64,
+    {
+        self.next_state_prefix_core(active_models, || (0, next()), |_, _| {}, |_| {})
+    }
+
+    #[inline]
+    fn next_state_prefix_core<F, O, B>(
+        &mut self,
+        active_models: usize,
+        mut next: F,
+        mut observe: O,
+        mut on_blink: B,
+    ) -> usize
+    where
+        F: FnMut() -> (i64, u64),
+        O: FnMut(ModelConsumption, i32),
+        B: FnMut(usize),
+    {
+        let mut used = 0;
+        for (model, remain) in self.remain.iter_mut().take(active_models).enumerate() {
+            if *remain > 1 {
+                *remain -= 1;
+                continue;
+            }
+            if *remain < 0 {
+                *remain += 1;
+                if *remain == 0 {
+                    let (position, value) = next();
+                    *remain = if value % 3 == 0 { 36 } else { 30 };
+                    used += 1;
+                    on_blink(model);
+                    observe(
+                        ModelConsumption {
+                            model,
+                            position,
+                            value,
+                            blink: true,
+                        },
+                        *remain,
+                    );
+                }
+                continue;
+            }
+
+            let (position, value) = next();
+            if value & 0x7f == 0 {
+                *remain = -5;
+            }
+            used += 1;
+            observe(
+                ModelConsumption {
+                    model,
+                    position,
+                    value,
+                    blink: false,
+                },
+                *remain,
+            );
+        }
+        used
     }
 
     /// 指定モデルの瞬き有無だけを返す軽量版。全モデルの状態更新と

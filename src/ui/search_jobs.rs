@@ -1,18 +1,23 @@
 use crate::application::field::{
-    FieldIdxInference, FieldSearchPool, FieldState, PreparedTimelineIndex,
+    FieldIdxInference, FieldSearchPool, PreparedTimelineIndex, TimelineExtensionResult,
 };
-use crate::application::state::CandidateReachabilityRequest;
 use crate::domain::rng::ObservationCache;
 use crate::errors::AppError;
 use crate::ui::app_types::{
-    CandidateReachabilityOutput, FieldSearchOutput, FieldTargetOutput, GuidanceGenerationOutput,
-    ProductionPreparationOutput,
+    CandidateReachabilityOutput, ConfirmedTargetSearchOutput, FieldSearchOutput, FieldTargetOutput,
+    GuidanceGenerationOutput, PreparedTimeleapTarget, PreparedTimeleapTargetOutput,
+    ProductionPreparationOutput, TimeleapCandidateOutput, TimeleapFrame1Output,
+    TimeleapFrame1PreviewOutput, TimeleapReachabilityOutput, TimeleapShiftResolutionOutput,
+    TimeleapTargetCheckOutput,
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::thread::JoinHandle;
+
+pub(super) type PreparedTimeleapTargetJob =
+    Box<dyn FnOnce(Arc<AtomicBool>) -> PreparedTimeleapTargetOutput + Send + 'static>;
 
 /// ワーカーの実行・キャンセル・完了取得を一体で管理する。
 ///
@@ -130,21 +135,36 @@ pub(super) struct SearchJobs {
     pub(super) field_target_generation: WorkerTask<FieldTargetOutput>,
     pub(super) field_pool_generation: WorkerTask<Result<FieldSearchPool, AppError>>,
     pub(super) field_timeline_generation: WorkerTask<Result<PreparedTimelineIndex, AppError>>,
-    pub(super) field_timeline_extension: WorkerTask<(FieldState, Result<bool, AppError>)>,
-    pub(super) field_timeline_extension_key: Option<(usize, i64, i64)>,
+    pub(super) field_timeline_extension: WorkerTask<Result<TimelineExtensionResult, AppError>>,
+    pub(super) field_timeline_extension_key: Option<u64>,
+    pub(super) field_timeline_extension_generation: u64,
     pub(super) field_timeline_extension_blocked: bool,
     pub(super) field_timeline_extension_error: Option<Arc<AppError>>,
     pub(super) field_pool: Option<FieldSearchPool>,
     pub(super) field_idx_inference: WorkerTask<Result<FieldIdxInference, AppError>>,
+    pub(super) field_timeleap_candidates: WorkerTask<TimeleapCandidateOutput>,
+    pub(super) field_timeleap_frame1: WorkerTask<TimeleapFrame1Output>,
+    pub(super) field_timeleap_prepared_target: WorkerTask<PreparedTimeleapTargetOutput>,
+    pub(super) prepared_timeleap_target: Option<PreparedTimeleapTarget>,
+    pending_prepared_timeleap_target: Option<PreparedTimeleapTargetJob>,
+    pub(super) field_timeleap_frame1_preview: WorkerTask<TimeleapFrame1PreviewOutput>,
+    pub(super) field_timeleap_target_check: WorkerTask<TimeleapTargetCheckOutput>,
+    pub(super) field_timeleap_reachability: WorkerTask<TimeleapReachabilityOutput>,
+    pub(super) field_timeleap_shift_resolution: WorkerTask<TimeleapShiftResolutionOutput>,
+    pub(super) field_confirmed_target_search: WorkerTask<ConfirmedTargetSearchOutput>,
+    pub(super) field_confirmed_target_search_key: Option<(u64, u64)>,
     pub(super) field_search_needs_restart: bool,
     pub(super) guidance_generation: WorkerTask<GuidanceGenerationOutput>,
     pub(super) candidate_reachability: WorkerTask<CandidateReachabilityOutput>,
-    pub(super) candidate_reachability_key: Option<CandidateReachabilityRequest>,
+    pub(super) candidate_reachability_key:
+        Option<crate::application::state::CandidateReachabilityKey>,
+    pub(super) normal_target_wait: WorkerTask<crate::ui::app_types::NormalTargetWaitOutput>,
+    pub(super) normal_target_wait_key: Option<crate::application::state::NormalTargetWaitKey>,
     pub(super) production_preparation: WorkerTask<ProductionPreparationOutput>,
 }
 
 impl SearchJobs {
-    /// Field検索セッションに属するワーカーをすべてキャンセルし、結果を破棄する。
+    /// Field観測セッションに属するワーカーをキャンセルし、結果を破棄する。
     ///
     /// ワーカーの寿命は画面表示やタイマー状態ではなく検索セッションに属するため、
     /// キャンセル通知とハンドル破棄を同じ場所で管理する。
@@ -154,12 +174,67 @@ impl SearchJobs {
         self.field_search_needs_restart = false;
         self.field_pool_generation.cancel_and_discard();
         self.field_timeline_generation.cancel_and_discard();
+        self.cancel_field_timeline_extension();
+        self.field_idx_inference.cancel_and_discard();
+        // Frame1候補検索はメイン観測から独立した検索ウィンドウのworker。
+        self.field_timeleap_frame1.cancel_and_discard();
+        self.cancel_prepared_timeleap_target();
+        self.field_timeleap_frame1_preview.cancel_and_discard();
+        self.field_timeleap_target_check.cancel_and_discard();
+        self.field_timeleap_reachability.cancel_and_discard();
+        self.field_timeleap_shift_resolution.cancel_and_discard();
+        self.field_confirmed_target_search.cancel_and_discard();
+        self.field_confirmed_target_search_key = None;
+        self.field_pool = None;
+    }
+
+    pub(super) fn cancel_prepared_timeleap_target(&mut self) {
+        self.field_timeleap_prepared_target.cancel();
+        self.pending_prepared_timeleap_target = None;
+        self.prepared_timeleap_target = None;
+    }
+
+    pub(super) fn queue_prepared_timeleap_target(&mut self, job: PreparedTimeleapTargetJob) {
+        self.prepared_timeleap_target = None;
+        if self.field_timeleap_prepared_target.is_running() {
+            self.pending_prepared_timeleap_target = Some(job);
+            self.field_timeleap_prepared_target.cancel();
+            return;
+        }
+        self.spawn_prepared_timeleap_target(job);
+    }
+
+    pub(super) fn poll_prepared_timeleap_target(&mut self) -> bool {
+        if let Some((cancelled, joined)) = self.field_timeleap_prepared_target.take_finished() {
+            if !cancelled && self.pending_prepared_timeleap_target.is_none() {
+                if let Ok(Ok(prepared)) = joined {
+                    self.prepared_timeleap_target = Some(prepared);
+                }
+            }
+            if let Some(job) = self.pending_prepared_timeleap_target.take() {
+                self.spawn_prepared_timeleap_target(job);
+            }
+        }
+        self.field_timeleap_prepared_target.is_running()
+    }
+
+    fn spawn_prepared_timeleap_target(&mut self, job: PreparedTimeleapTargetJob) {
+        let started = self
+            .field_timeleap_prepared_target
+            .spawn_cancellable(move |cancel| job(cancel));
+        debug_assert!(
+            started,
+            "prepared target worker slot must be idle before spawn"
+        );
+    }
+
+    pub(super) fn cancel_field_timeline_extension(&mut self) {
         self.field_timeline_extension.cancel_and_discard();
-        self.field_timeline_extension_key.take();
+        self.field_timeline_extension_key = None;
+        self.field_timeline_extension_generation =
+            self.field_timeline_extension_generation.wrapping_add(1);
         self.field_timeline_extension_blocked = false;
         self.field_timeline_extension_error = None;
-        self.field_idx_inference.cancel_and_discard();
-        self.field_pool = None;
     }
 
     pub(super) fn cancel_field_idx_inference(&self) {
@@ -177,9 +252,9 @@ mod tests {
     };
 
     #[test]
-    fn cancelling_field_session_signals_every_field_worker_and_resets_session_jobs() {
+    fn cancelling_field_session_preserves_independent_frame1_search_worker() {
         let mut jobs = SearchJobs::default();
-        let tokens = (0..5)
+        let tokens = (0..14)
             .map(|_| Arc::new(AtomicBool::new(false)))
             .collect::<Vec<_>>();
         jobs.field_generation.cancel = Some(tokens[0].clone());
@@ -187,21 +262,47 @@ mod tests {
         jobs.field_timeline_generation.cancel = Some(tokens[2].clone());
         jobs.field_target_generation.cancel = Some(tokens[3].clone());
         jobs.field_idx_inference.cancel = Some(tokens[4].clone());
+        jobs.field_timeleap_candidates.cancel = Some(tokens[5].clone());
+        jobs.field_timeleap_frame1.cancel = Some(tokens[6].clone());
+        jobs.field_timeleap_frame1_preview.cancel = Some(tokens[7].clone());
+        jobs.field_timeleap_reachability.cancel = Some(tokens[8].clone());
+        jobs.field_timeleap_target_check.cancel = Some(tokens[9].clone());
+        jobs.field_confirmed_target_search.cancel = Some(tokens[10].clone());
+        jobs.field_timeleap_shift_resolution.cancel = Some(tokens[11].clone());
+        jobs.field_timeline_extension.cancel = Some(tokens[12].clone());
+        jobs.field_timeleap_prepared_target.cancel = Some(tokens[13].clone());
+        jobs.field_confirmed_target_search_key = Some((3, 2));
         jobs.field_search_needs_restart = true;
         jobs.field_timeline_extension_blocked = true;
         jobs.field_timeline_extension_error = Some(Arc::new(AppError::WorkerPanicked));
 
         jobs.cancel_field_session();
 
-        assert!(tokens.iter().all(|token| token.load(Ordering::Acquire)));
+        assert!(tokens
+            .iter()
+            .enumerate()
+            .all(|(index, token)| token.load(Ordering::Acquire) == (index != 5)));
         assert!(!jobs.field_search_needs_restart);
         assert!(!jobs.field_timeline_extension_blocked);
         assert!(jobs.field_timeline_extension_error.is_none());
+        assert!(jobs.field_timeline_extension_key.is_none());
+        assert_eq!(jobs.field_timeline_extension_generation, 1);
         assert!(jobs.field_generation.cancel.is_none());
         assert!(jobs.field_pool_generation.cancel.is_none());
         assert!(jobs.field_timeline_generation.cancel.is_none());
         assert!(jobs.field_target_generation.cancel.is_none());
         assert!(jobs.field_idx_inference.cancel.is_none());
+        assert!(jobs.field_timeleap_candidates.cancel.is_some());
+        assert!(jobs.field_timeleap_frame1.cancel.is_none());
+        assert!(jobs.field_timeleap_prepared_target.cancel.is_some());
+        assert!(jobs.pending_prepared_timeleap_target.is_none());
+        assert!(jobs.field_timeleap_frame1_preview.cancel.is_none());
+        assert!(jobs.field_timeleap_target_check.cancel.is_none());
+        assert!(jobs.field_confirmed_target_search.cancel.is_none());
+        assert!(jobs.field_timeleap_shift_resolution.cancel.is_none());
+        assert!(jobs.field_timeline_extension.cancel.is_none());
+        assert!(jobs.field_confirmed_target_search_key.is_none());
+        assert!(jobs.field_timeleap_reachability.cancel.is_none());
     }
 
     #[test]
@@ -215,6 +316,14 @@ mod tests {
         });
 
         task.cancel();
+        assert!(
+            task.is_running(),
+            "requesting cancellation must retain its worker handle"
+        );
+        assert!(
+            !task.spawn(|| panic!("a retry must wait until cancellation is collected")),
+            "cancellation must not detach the old worker and overlap a retry"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         while !task.is_finished() && std::time::Instant::now() < deadline {
             std::thread::yield_now();
@@ -226,6 +335,19 @@ mod tests {
         assert!(cancelled);
         assert_eq!(result, Ok(42));
         assert!(!task.is_running());
+
+        assert!(
+            task.spawn(|| 7),
+            "retry is allowed after the old worker is joined"
+        );
+        while !task.is_finished() {
+            std::thread::yield_now();
+        }
+        let Some((cancelled, result)) = task.take_finished() else {
+            panic!("retry worker should be collected");
+        };
+        assert!(!cancelled);
+        assert_eq!(result, Ok(7));
     }
 
     #[test]
@@ -247,5 +369,113 @@ mod tests {
         };
         assert!(!cancelled);
         assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn prepared_target_requests_coalesce_while_cancelled_worker_is_reaped() {
+        let mut jobs = SearchJobs::default();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ran_old = Arc::new(AtomicBool::new(false));
+        let ran_middle = Arc::new(AtomicBool::new(false));
+        let ran_latest = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+        let worker_active = active.clone();
+        let worker_maximum = maximum_active.clone();
+        let worker_ran_old = ran_old.clone();
+        assert!(jobs
+            .field_timeleap_prepared_target
+            .spawn_cancellable(move |cancel| {
+                let count = worker_active.fetch_add(1, Ordering::SeqCst) + 1;
+                worker_maximum.fetch_max(count, Ordering::SeqCst);
+                worker_ran_old.store(true, Ordering::SeqCst);
+                started_tx.send(()).unwrap();
+                while !cancel.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                worker_active.fetch_sub(1, Ordering::SeqCst);
+                Err(AppError::Cancelled)
+            }));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let worker_active = active.clone();
+        let worker_maximum = maximum_active.clone();
+        let worker_ran_middle = ran_middle.clone();
+        jobs.queue_prepared_timeleap_target(Box::new(move |_| {
+            let count = worker_active.fetch_add(1, Ordering::SeqCst) + 1;
+            worker_maximum.fetch_max(count, Ordering::SeqCst);
+            worker_ran_middle.store(true, Ordering::SeqCst);
+            worker_active.fetch_sub(1, Ordering::SeqCst);
+            Err(AppError::Cancelled)
+        }));
+
+        let worker_active = active.clone();
+        let worker_maximum = maximum_active.clone();
+        let worker_ran_latest = ran_latest.clone();
+        jobs.queue_prepared_timeleap_target(Box::new(move |_| {
+            let count = worker_active.fetch_add(1, Ordering::SeqCst) + 1;
+            worker_maximum.fetch_max(count, Ordering::SeqCst);
+            worker_ran_latest.store(true, Ordering::SeqCst);
+            worker_active.fetch_sub(1, Ordering::SeqCst);
+            Err(AppError::Cancelled)
+        }));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while jobs.field_timeleap_prepared_target.is_running()
+            && std::time::Instant::now() < deadline
+        {
+            jobs.poll_prepared_timeleap_target();
+            std::thread::yield_now();
+        }
+        jobs.poll_prepared_timeleap_target();
+
+        assert!(ran_old.load(Ordering::SeqCst));
+        assert!(!ran_middle.load(Ordering::SeqCst));
+        assert!(ran_latest.load(Ordering::SeqCst));
+        assert_eq!(maximum_active.load(Ordering::SeqCst), 1);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(!jobs.field_timeleap_prepared_target.is_running());
+    }
+
+    #[test]
+    fn cancelling_prepared_target_clears_pending_request_without_detaching_worker() {
+        let mut jobs = SearchJobs::default();
+        let ran_pending = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        assert!(jobs
+            .field_timeleap_prepared_target
+            .spawn_cancellable(move |cancel| {
+                started_tx.send(()).unwrap();
+                while !cancel.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                Err(AppError::Cancelled)
+            }));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let pending_ran = ran_pending.clone();
+        jobs.queue_prepared_timeleap_target(Box::new(move |_| {
+            pending_ran.store(true, Ordering::SeqCst);
+            Err(AppError::Cancelled)
+        }));
+        jobs.cancel_prepared_timeleap_target();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while jobs.field_timeleap_prepared_target.is_running()
+            && std::time::Instant::now() < deadline
+        {
+            jobs.poll_prepared_timeleap_target();
+            std::thread::yield_now();
+        }
+        jobs.poll_prepared_timeleap_target();
+
+        assert!(!ran_pending.load(Ordering::SeqCst));
+        assert!(!jobs.field_timeleap_prepared_target.is_running());
+        assert!(jobs.pending_prepared_timeleap_target.is_none());
     }
 }

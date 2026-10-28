@@ -3,8 +3,7 @@
 //! 画面はアプリケーション状態が作成した不変の案内スナップショットだけを描画し、
 //! 検索とタイマーの計算は状態管理側で行う。
 
-use crate::application::state::AppState;
-use crate::errors::AppError;
+use crate::application::state_types::HatchGuidance;
 use crate::ui::i18n::Texts;
 use crate::ui::widgets::ColorScheme;
 use eframe::egui;
@@ -45,14 +44,14 @@ fn next_circle_count_text(
 
 pub(crate) fn hatch_guidance_ui(
     ui: &mut egui::Ui,
-    state: &mut AppState,
+    guidance: Option<HatchGuidance>,
+    target_dirty: bool,
+    guidance_searching: bool,
     height: f32,
     scale: f32,
     color_scheme: ColorScheme,
     texts: &Texts,
-) -> Result<(), AppError> {
-    let guidance = state.hatch_guidance()?;
-    let guidance_searching = state.guidance_search_pending();
+) {
     if guidance_searching {
         ui.ctx().request_repaint_after(Duration::from_millis(20));
     }
@@ -68,7 +67,7 @@ pub(crate) fn hatch_guidance_ui(
                 // Target入力中は到達判定を更新せず、判定表示を横棒で保留する。
                 // 既知の次の○がある場合は、現在Frameの判定更新中も値を維持する。
                 let (count_label, count_unknown) =
-                    next_circle_count_text(guidance, state.target_dirty, guidance_searching);
+                    next_circle_count_text(guidance, target_dirty, guidance_searching);
                 let count_color = if count_unknown {
                     color_scheme.colors_for_ui(ui).neutral
                 } else if guidance.is_some_and(|value| value.next_circle_frame.is_some()) {
@@ -166,7 +165,6 @@ pub(crate) fn hatch_guidance_ui(
             },
         );
     });
-    Ok(())
 }
 
 #[cfg(test)]

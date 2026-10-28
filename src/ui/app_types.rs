@@ -4,7 +4,11 @@ use crate::errors::AppError;
 
 pub(super) type GuidanceGenerationOutput = (
     crate::application::state::GuidanceSearchRequest,
-    Result<Vec<(i64, bool)>, AppError>,
+    Result<Vec<(i64, bool, f64)>, AppError>,
+);
+pub(super) type NormalTargetWaitOutput = (
+    crate::application::state::NormalTargetWaitRequest,
+    Result<Option<i64>, AppError>,
 );
 pub(super) type CandidateReachabilityOutput = (
     crate::application::state::CandidateReachabilityRequest,
@@ -48,6 +52,89 @@ impl FieldTargetKey {
 }
 
 pub(super) type FieldTargetOutput = (FieldTargetKey, Result<FieldResult, AppError>);
+pub(super) struct PreparedTimeleapTarget {
+    pub(super) seed: u32,
+    pub(super) target: i64,
+    pub(super) candidate: crate::domain::timeleap::TimeleapCandidate,
+    pub(super) result: FieldResult,
+}
+pub(super) type PreparedTimeleapTargetOutput = Result<PreparedTimeleapTarget, AppError>;
+pub(super) type TimeleapCandidateOutput = (
+    crate::domain::timeleap::TimeleapSearchKey,
+    Result<
+        Vec<crate::domain::timeleap::TimeleapCandidateGroup>,
+        crate::domain::timeleap::TimeleapSearchFailure,
+    >,
+);
+
+pub(super) type TimeleapFrame1Output = Result<
+    crate::domain::timeleap::TimeleapFrame1Preparation,
+    crate::domain::timeleap::TimeleapSearchFailure,
+>;
+pub(super) enum TimeleapFrame1PreviewCompletion {
+    Calculated(TimeleapFrame1Output),
+    Panicked,
+}
+pub(super) type TimeleapFrame1PreviewOutput = (
+    u64,
+    crate::domain::timeleap::TimeleapConfig,
+    i64,
+    crate::domain::timeleap::TimeleapTimelineStart,
+    std::time::Instant,
+    TimeleapFrame1PreviewCompletion,
+);
+pub(super) enum TimeleapTargetCheckCompletion {
+    Calculated(Result<bool, crate::domain::timeleap::TimeleapSearchFailure>),
+    Panicked,
+}
+
+pub(super) type TimeleapTargetCheckOutput = (u64, i64, TimeleapTargetCheckCompletion);
+
+fn catch_worker_panic<T>(work: impl FnOnce() -> T) -> Result<T, ()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).map_err(|_| ())
+}
+
+pub(super) fn run_timeleap_frame1_preview(
+    generation: u64,
+    prepare: impl FnOnce() -> TimeleapFrame1Output,
+) -> (u64, TimeleapFrame1PreviewCompletion) {
+    let completion = match catch_worker_panic(prepare) {
+        Ok(result) => TimeleapFrame1PreviewCompletion::Calculated(result),
+        Err(()) => TimeleapFrame1PreviewCompletion::Panicked,
+    };
+    (generation, completion)
+}
+
+pub(super) fn run_timeleap_target_check(
+    generation: u64,
+    target_frame: i64,
+    check: impl FnOnce() -> Result<bool, crate::domain::timeleap::TimeleapSearchFailure>,
+) -> TimeleapTargetCheckOutput {
+    let completion = match catch_worker_panic(check) {
+        Ok(result) => TimeleapTargetCheckCompletion::Calculated(result),
+        Err(()) => TimeleapTargetCheckCompletion::Panicked,
+    };
+    (generation, target_frame, completion)
+}
+pub(super) type TimeleapReachabilityOutput = (
+    u64,
+    Result<
+        crate::domain::timeleap::TimeleapReachability,
+        crate::domain::timeleap::TimeleapSearchFailure,
+    >,
+);
+pub(super) type ConfirmedTargetSearchOutput = (
+    u64,
+    crate::domain::timeleap::ConfirmedTargetSearchRequest,
+    Result<
+        crate::domain::timeleap::ConfirmedTargetSearchResult,
+        crate::domain::timeleap::TimeleapSearchFailure,
+    >,
+);
+pub(super) type TimeleapShiftResolutionOutput = (
+    u64,
+    Option<crate::application::field::TimeleapShiftResolutionSummary>,
+);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum AppTab {
@@ -87,4 +174,34 @@ pub(super) enum CorrectionDialog {
         unknown: bool,
         suggested_offset: Option<i64>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_check_panic_retains_request_identity() {
+        let (generation, target, completion) =
+            run_timeleap_target_check(17, 42_000, || panic!("simulated Target check panic"));
+
+        assert_eq!(generation, 17);
+        assert_eq!(target, 42_000);
+        assert!(matches!(
+            completion,
+            TimeleapTargetCheckCompletion::Panicked
+        ));
+    }
+
+    #[test]
+    fn frame1_preview_panic_retains_request_generation() {
+        let (generation, completion) =
+            run_timeleap_frame1_preview(23, || panic!("simulated Frame1 preview panic"));
+
+        assert_eq!(generation, 23);
+        assert!(matches!(
+            completion,
+            TimeleapFrame1PreviewCompletion::Panicked
+        ));
+    }
 }

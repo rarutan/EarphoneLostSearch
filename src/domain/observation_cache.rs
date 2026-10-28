@@ -4,6 +4,8 @@ use crate::errors::{AppError, AppResult, ArithmeticOperation, CacheError, CacheI
 // 8 MiB弱のSFMT出力数。SFMT内部状態が312個の64bit出力ごとに更新されるため、
 // チャンク末尾もその境界に揃える。値は64の倍数にもなっている。
 pub(crate) const CACHE_EXTENSION_CHUNK_VALUES: u64 = 1_048_320;
+#[cfg(test)]
+static TEST_CACHE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[allow(dead_code)]
 pub struct BlinkTableRow {
@@ -79,6 +81,43 @@ pub struct ObservationMatch {
 }
 
 impl ObservationCache {
+    #[cfg(test)]
+    pub(crate) fn from_seed_for_test(seed: u32, last_position: i64, fps: f64) -> Self {
+        let sequence = TEST_CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "hbs-test-sfmt-{seed:08X}-{}-{sequence}.bin",
+            std::process::id()
+        ));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create isolated test SFMT cache");
+        let mut file = std::io::BufWriter::new(file);
+        let value_count = last_position.max(0).saturating_add(1) as u64;
+        file.write_all(b"HBSFMT\0\0")
+            .and_then(|_| file.write_all(&OBSERVATION_CACHE_VERSION.to_le_bytes()))
+            .and_then(|_| file.write_all(&seed.to_le_bytes()))
+            .and_then(|_| file.write_all(&value_count.to_le_bytes()))
+            .expect("write test cache header");
+        let mut sfmt = Sfmt::new(seed);
+        for _ in 0..value_count {
+            file.write_all(&sfmt.next_u64().to_le_bytes())
+                .expect("write test SFMT value");
+        }
+        file.flush().expect("flush test SFMT cache");
+        drop(file);
+        Self {
+            seed,
+            range_start: 0,
+            range_end: last_position.max(0),
+            fps,
+            cache_file: Arc::new(crate::infrastructure::cache_store::CacheFileLease { path }),
+            value_count: Arc::new(std::sync::atomic::AtomicU64::new(value_count)),
+            extension_sfmt: Arc::new(std::sync::Mutex::new(sfmt)),
+        }
+    }
+
     /// キャッシュファイル上で実際に読み出せる絶対SFMT位置の終端。
     /// `range_end`は検索対象範囲の終端であり、照合用先読み分を含まない。
     pub fn available_end(&self) -> i64 {

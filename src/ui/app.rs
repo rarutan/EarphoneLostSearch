@@ -1,19 +1,18 @@
 use crate::application::defaults;
-use crate::application::field::{FieldState, FieldTargetMode, FieldTimerKind};
-use crate::application::state::{AppState, SavedOffset};
-use crate::domain::timing::beep_offsets_for_segment;
-use crate::errors::{AppError, StateIssue};
-use crate::infrastructure::audio::{fallback_beep, fallback_candidate_not_found, AudioOutput};
-use crate::infrastructure::persistence::{
-    PersistedAppState, PersistedField, PersistedHatch, PersistedNormalTimer,
-};
+use crate::application::field::{FieldState, FieldTimerKind};
+use crate::application::state::AppState;
+use crate::errors::AppError;
+#[cfg(test)]
+use crate::errors::StateIssue;
+use crate::infrastructure::audio::AudioOutput;
+use crate::infrastructure::persistence::PersistedAppState;
 use crate::ui::app_types::*;
 use crate::ui::beep_scheduler::BeepScheduler;
-use crate::ui::field_view::{field_ui, FieldUiWorkerState};
+use crate::ui::field_view::{field_ui, timeleap_window_keepalive_ui, FieldUiWorkerState};
 use crate::ui::hatch_view::hatch_guidance_ui;
 use crate::ui::i18n::{Language, Texts};
 use crate::ui::layout::{
-    ACTION_ROW_HEIGHT, LEFT_PANEL_WIDTH, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, PANEL_GAP,
+    split_panel_rects, ACTION_ROW_HEIGHT, LEFT_PANEL_WIDTH, PANEL_GAP,
     PANEL_PADDING as PANEL_INNER_PADDING, TIMER_PANEL_HEIGHT as TIMER_DISPLAY_HEIGHT,
     TOP_PANEL_HEIGHT,
 };
@@ -21,19 +20,31 @@ use crate::ui::search_jobs::SearchJobs;
 use crate::ui::settings_view::settings_ui;
 use crate::ui::timer_view::normal_timer_ui;
 use crate::ui::widgets::{
-    draw_timer_flash, fixed_group_panel, frame_spinner, horizontal_frame_spinner,
-    install_app_style, install_japanese_font, nonnegative_frame_spinner_with_commit, npc_spinner,
-    numeric_text_edit, offset_spinner_with_commit, wide_button, ColorScheme, FlashMode,
-    COMPACT_ACTION_SIZE,
+    draw_timer_flash, fixed_group_panel, horizontal_frame_spinner, install_app_style,
+    install_japanese_font, nonnegative_frame_spinner_with_commit, npc_spinner, numeric_text_edit,
+    offset_spinner_with_commit, wide_button, ColorScheme, FlashMode, COMPACT_ACTION_SIZE,
 };
 use eframe::egui;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 use std::time::{Duration, Instant};
 
+mod correction;
+mod observation;
+mod offset_manager;
+mod persistence;
+mod timeleap_workers;
+mod timeline_workers;
+mod timer;
+mod worker;
+
 const TIMELINE_HEADER_HEIGHT: f32 = 24.0;
+
+fn keep_timeleap_window_viewport(tab: AppTab, is_open: bool) -> bool {
+    tab != AppTab::Field && is_open
+}
+
+fn should_refresh_single_field_timeline(result_count: usize, correction_mode: bool) -> bool {
+    result_count == 1 && !correction_mode
+}
 
 pub struct UiApp {
     pub state: AppState,
@@ -146,7 +157,7 @@ impl eframe::App for UiApp {
             self.present_app_error(error);
         }
         if self.cache_access_alert.is_some() {
-            self.show_cache_access_alert(ctx);
+            self.show_cache_access_alert(ctx, &texts);
             return;
         }
         let hatch_was_unique = self.state.candidates.len() == 1;
@@ -158,8 +169,18 @@ impl eframe::App for UiApp {
         self.start_field_timeline_extension(ctx);
         self.poll_field_generation(ctx);
         self.poll_field_target_generation(ctx);
+        self.poll_field_timeleap_candidates(ctx);
+        self.poll_field_timeleap_frame1(ctx);
+        self.poll_prepared_timeleap_target(ctx);
+        self.ensure_field_timeleap_frame1_preview(ctx);
+        self.poll_field_timeleap_frame1_preview(ctx);
+        self.poll_field_timeleap_target_check(ctx);
+        self.poll_field_timeleap_reachability(ctx);
+        self.poll_field_timeleap_shift_resolution(ctx);
+        self.poll_field_confirmed_target_search(ctx);
         self.poll_field_idx_inference(ctx);
         self.poll_guidance_generation();
+        self.poll_normal_target_wait_fallback();
         self.poll_candidate_reachability();
         self.poll_production_preparation();
         if self.correction_calculating {
@@ -201,7 +222,7 @@ impl eframe::App for UiApp {
             }
         }
         if self.cache_access_alert.is_some() {
-            self.show_cache_access_alert(ctx);
+            self.show_cache_access_alert(ctx, &Texts::new(self.language));
             return;
         }
         // リセット／キャンセルは描画中に発生するため、次のフレームの処理前に
@@ -232,6 +253,10 @@ impl eframe::App for UiApp {
         let right = ctx.input(|input| input.key_pressed(egui::Key::ArrowRight));
         let up = ctx.input(|input| input.key_pressed(egui::Key::ArrowUp));
         let down = ctx.input(|input| input.key_pressed(egui::Key::ArrowDown));
+        let now = Instant::now();
+        if self.tab == AppTab::Field && self.field.tick_timeleap_frame1(now) {
+            self.handle_timeleap_frame1_transition(ctx, now);
+        }
         // 補正ボタンと同じ有効状態で左右キーを受け付け、画面上の操作と
         // キーボード操作を同じ状態遷移へ接続する。
         if global_shortcuts_enabled && self.tab == AppTab::Hatch && self.state.is_blink_phase() {
@@ -261,6 +286,25 @@ impl eframe::App for UiApp {
                 && self.field.configs().is_ok()
             {
                 self.field.start_observation();
+            }
+        } else if global_shortcuts_enabled
+            && shift_pressed
+            && self.tab == AppTab::Field
+            && self.field.timeleap_accepts_shift()
+        {
+            if let Ok(Some(request)) = self
+                .field
+                .prepare_timeleap_shift_resolution(Instant::now(), self.state.fps_value())
+            {
+                let generation = request.generation;
+                let repaint = ctx.clone();
+                self.jobs
+                    .field_timeleap_shift_resolution
+                    .spawn_cancellable(move |cancel| {
+                        let survivors = request.resolve(Some(cancel.as_ref()));
+                        repaint.request_repaint();
+                        (generation, survivors)
+                    });
             }
         } else if global_shortcuts_enabled
             && shift_pressed
@@ -312,20 +356,51 @@ impl eframe::App for UiApp {
             && self.tab == AppTab::Field
             && !self.field.is_correction_mode()
             && self.field.results.len() == 1
+            && !(self.field.timeleap_enabled && self.field.timeleap_succeeded())
+            && !self.field.timeleap_frame1_preparing
             && !self.jobs.field_generation.is_running()
             && !self.jobs.field_pool_generation.is_running()
             && !self.jobs.field_idx_inference.is_running()
         {
-            self.field.enter_correction_mode(self.state.fps_value());
-            self.beeps.field.clear();
-            self.beeps.field_start = None;
+            if self.field.timeleap_enabled {
+                if self.field.timeleap_frame1_waiting() {
+                    self.field.cancel_timeleap_ready();
+                    self.jobs.cancel_prepared_timeleap_target();
+                    self.beeps.field.clear();
+                    self.beeps.field_start = None;
+                } else if self.field.timeleap_failed() {
+                    self.field.timeleap_retry(self.state.fps_value());
+                } else if self.field.timeleap_assumed() {
+                    if let Err(error) = self.field.begin_timeleap_recheck(
+                        self.field.target_is_passed(self.state.fps_value()),
+                        self.state.fps_value(),
+                    ) {
+                        if error.is_cache_io() {
+                            self.present_app_error(error);
+                        } else {
+                            self.field.notice = Some(texts.app_error(&error));
+                        }
+                    }
+                } else if self.field.timeleap_lifecycle_policy().phase
+                    == crate::application::field::TimeleapLifecyclePhase::Frame1Setup
+                {
+                    self.start_field_timeleap_frame1_preparation(ctx);
+                }
+            } else {
+                self.field.enter_correction_mode(self.state.fps_value());
+            }
+            if !self.field.timeleap_accepts_shift() {
+                self.beeps.field.clear();
+                self.beeps.field_start = None;
+            }
         }
         // タイムライン仕様のタイマーモードは、テキスト入力欄にフォーカスがないときだけ
         // 上下キーで切り替える。入力欄のカーソル操作とは競合させない。
         if self.tab == AppTab::Field && global_shortcuts_enabled && (up || down) {
             if let Err(message) = self.field.toggle_timer_kind(self.state.fps_value()) {
                 if self.field.next_blink_out_of_range {
-                    self.field.set_search_range_notice(message.to_string());
+                    self.field
+                        .set_search_range_notice(texts.app_error(&message));
                 }
             } else {
                 // モード切替では新しいタイマー区間を作る。Target区間の終了音を
@@ -417,7 +492,10 @@ impl eframe::App for UiApp {
         }
         if self.field.timer_is_running()
             || !self.beeps.field.is_empty()
-            || self.field.results.len() == 1
+            || should_refresh_single_field_timeline(
+                self.field.results.len(),
+                self.field.is_correction_mode(),
+            )
         {
             // フィールドのTimeline Currentはゲーム内1/30秒単位で進む。候補がある間は
             // 同じ周期で再描画し、表示行が内部時計から遅れないようにする。
@@ -459,6 +537,20 @@ impl eframe::App for UiApp {
         } else {
             self.timer_flash_until = None;
         }
+
+        let (hatch_guidance_snapshot, hatch_guidance_searching) = if self.tab == AppTab::Hatch {
+            let (guidance, searching) = match self.state.hatch_guidance_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.present_app_error(error);
+                    (None, false)
+                }
+            };
+            self.maybe_start_normal_target_wait_fallback(ctx, guidance);
+            (guidance, searching)
+        } else {
+            (None, false)
+        };
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -532,6 +624,16 @@ impl eframe::App for UiApp {
                         search_running: self.jobs.field_generation.is_running(),
                         pool_generation_running: self.jobs.field_pool_generation.is_running(),
                         idx_inference_running: self.jobs.field_idx_inference.is_running(),
+                        timeleap_search_running: self.jobs.field_timeleap_candidates.is_running(),
+                        confirmed_target_search_running: self
+                            .jobs
+                            .field_confirmed_target_search
+                            .is_running(),
+                        timeleap_frame1_running: self.jobs.field_timeleap_frame1.is_running(),
+                        timeleap_frame1_preview_running: self
+                            .jobs
+                            .field_timeleap_frame1_preview
+                            .is_running(),
                     },
                     ctx,
                     self.state.fps_value(),
@@ -539,6 +641,7 @@ impl eframe::App for UiApp {
                     self.wheel_offset_enabled,
                     self.color_scheme,
                     &texts,
+                    self.state.fastest_close,
                 );
                 if let Some(error) = self.field.take_timeline_stream_error() {
                     if error.is_cache_io() {
@@ -546,15 +649,93 @@ impl eframe::App for UiApp {
                         return;
                     }
                 }
+                if field_actions.timeleap_enabled_changed {
+                    self.beeps.field.clear();
+                    self.beeps.field_start = None;
+                }
                 if field_actions.cancelled {
                     self.cancel_field_background_tasks();
                     self.clear_unused_sfmt_cache_files();
+                }
+                if field_actions.timeleap_search_cancel_requested {
+                    self.jobs.cancel_prepared_timeleap_target();
+                    self.jobs.field_timeleap_candidates.cancel();
+                    self.jobs.field_timeleap_target_check.cancel_and_discard();
+                    self.field.clear_timeleap_candidates();
+                }
+                if field_actions.timeleap_candidate_search_cancel_requested {
+                    self.jobs.field_timeleap_candidates.cancel();
+                }
+                if field_actions.confirmed_target_search_cancel_requested {
+                    self.jobs.field_confirmed_target_search.cancel();
+                }
+                if field_actions.timeleap_frame1_preview_requested {
+                    self.start_field_timeleap_frame1_preview(ctx);
+                }
+                if field_actions.timeleap_reachability_search_requested {
+                    self.start_field_timeleap_reachability(ctx);
+                }
+                if let Some(row) = field_actions.confirmed_target_search_row.as_ref() {
+                    if self.field.set_confirmed_target_frame_from_search_row(row) {
+                        self.field.prepare_target_research(self.state.fps_value());
+                    }
+                }
+                if let Some(frame1) = field_actions.timeleap_frame1_offset_frame {
+                    if self
+                        .field
+                        .apply_timeleap_frame1_offset(frame1, self.state.fastest_close)
+                        .is_some()
+                    {
+                        self.field
+                            .refresh_target_timer_for_offset(self.state.fps_value());
+                    }
+                }
+                if let Some(drift_frames) = field_actions.confirmed_target_offset_drift_frames {
+                    if self
+                        .field
+                        .apply_timeleap_offset_drift(drift_frames, self.state.fastest_close)
+                        .is_some()
+                    {
+                        self.field
+                            .refresh_target_timer_for_offset(self.state.fps_value());
+                    }
+                }
+                if field_actions.confirmed_target_search_requested {
+                    self.start_field_confirmed_target_search(ctx);
                 }
                 if field_actions.observe_requested {
                     self.record_field_blink(ctx);
                 }
                 if field_actions.correction_requested {
-                    self.field.enter_correction_mode(self.state.fps_value());
+                    if self.field.timeleap_enabled && self.field.timeleap_failed() {
+                        self.field.timeleap_retry(self.state.fps_value());
+                    } else if self.field.timeleap_enabled
+                        && (self.field.timeleap_succeeded() || self.field.timeleap_assumed())
+                    {
+                        if let Err(error) = self.field.begin_timeleap_recheck(
+                            self.field.target_is_passed(self.state.fps_value()),
+                            self.state.fps_value(),
+                        ) {
+                            if error.is_cache_io() {
+                                self.present_app_error(error);
+                            } else {
+                                self.field.notice = Some(texts.app_error(&error));
+                            }
+                        }
+                    } else if self.field.timeleap_enabled
+                        && self.field.timeleap_lifecycle_policy().phase
+                            == crate::application::field::TimeleapLifecyclePhase::Frame1Setup
+                    {
+                        self.start_field_timeleap_frame1_preparation(ctx);
+                    } else if !self.field.timeleap_enabled {
+                        self.field.enter_correction_mode(self.state.fps_value());
+                    }
+                    self.beeps.field.clear();
+                    self.beeps.field_start = None;
+                }
+                if field_actions.timeleap_ready_cancel_requested {
+                    self.field.cancel_timeleap_ready();
+                    self.jobs.cancel_prepared_timeleap_target();
                     self.beeps.field.clear();
                     self.beeps.field_start = None;
                 }
@@ -579,6 +760,9 @@ impl eframe::App for UiApp {
                 // 確定したTargetから派生表示を更新する必要がある。
                 let target_refinement_requested =
                     field_actions.target_committed && self.field.target_research_pending;
+                if field_actions.timeleap_search_requested {
+                    self.request_field_timeleap_candidate_search(ctx);
+                }
                 let observation_search_requested =
                     field_actions.search_requested && self.field.intervals.len() >= 2;
                 if (target_refinement_requested || observation_search_requested)
@@ -636,13 +820,7 @@ impl eframe::App for UiApp {
                     .max_rect(top_rect)
                     .layout(egui::Layout::top_down(egui::Align::Min)),
             );
-            let right_panel_width = (top_rect.width() - LEFT_PANEL_WIDTH - PANEL_GAP).max(0.0);
-            let left_rect =
-                egui::Rect::from_min_size(top_rect.min, egui::vec2(LEFT_PANEL_WIDTH, top_height));
-            let right_rect = egui::Rect::from_min_size(
-                egui::pos2(left_rect.right() + PANEL_GAP, top_rect.top()),
-                egui::vec2(right_panel_width, top_height),
-            );
+            let (left_rect, right_rect) = split_panel_rects(top_rect, LEFT_PANEL_WIDTH, PANEL_GAP);
             top_ui.allocate_new_ui(
                 egui::UiBuilder::new()
                     .max_rect(left_rect)
@@ -672,14 +850,7 @@ impl eframe::App for UiApp {
                         // 予告ラベルを残さない。
                         String::new()
                     } else {
-                        let guidance = match self.state.hatch_guidance() {
-                            Ok(guidance) => guidance,
-                            Err(error) => {
-                                self.present_app_error(error);
-                                None
-                            }
-                        };
-                        guidance
+                        hatch_guidance_snapshot
                             .map(|guidance| {
                                 if guidance.search_out_of_range {
                                     texts.search_out_of_range().to_string()
@@ -700,7 +871,15 @@ impl eframe::App for UiApp {
                                         .unwrap_or_else(|| "—".into())
                                 }
                             })
-                            .unwrap_or_else(|| "—".into())
+                            .unwrap_or_else(|| {
+                                if !self.state.fastest_close
+                                    && self.jobs.normal_target_wait.is_running()
+                                {
+                                    texts.production_wait_calculating().to_string()
+                                } else {
+                                    "—".into()
+                                }
+                            })
                     };
 
                     // 上段左枠は固定矩形の中へ、Current・タイマー・補正を絶対配置する。
@@ -816,26 +995,23 @@ impl eframe::App for UiApp {
                 },
             );
             draw_timer_flash(&top_ui, left_rect, timer_flashing, self.color_scheme);
-            let mut hatch_guidance_error = None;
             top_ui.allocate_new_ui(
                 egui::UiBuilder::new()
                     .max_rect(right_rect)
                     .layout(egui::Layout::top_down(egui::Align::Min)),
                 |ui| {
-                    hatch_guidance_error = hatch_guidance_ui(
+                    hatch_guidance_ui(
                         ui,
-                        &mut self.state,
+                        hatch_guidance_snapshot,
+                        self.state.target_dirty,
+                        hatch_guidance_searching,
                         top_height,
                         text_scale,
                         self.color_scheme,
                         &texts,
-                    )
-                    .err();
+                    );
                 },
             );
-            if let Some(error) = hatch_guidance_error {
-                self.present_app_error(error);
-            }
 
             ui.separator();
             // 下段も左右の枠を先に固定し、各コンポーネントは枠内で相対配置する。
@@ -844,15 +1020,8 @@ impl eframe::App for UiApp {
             let bottom_height = ui.available_height().max(0.0);
             let (_, bottom_rect) =
                 ui.allocate_space(egui::vec2(ui.available_width(), bottom_height));
-            let right_panel_width = (bottom_rect.width() - LEFT_PANEL_WIDTH - PANEL_GAP).max(0.0);
-            let bottom_left_rect = egui::Rect::from_min_size(
-                bottom_rect.min,
-                egui::vec2(LEFT_PANEL_WIDTH, bottom_rect.height()),
-            );
-            let bottom_right_rect = egui::Rect::from_min_size(
-                egui::pos2(bottom_left_rect.right() + PANEL_GAP, bottom_rect.top()),
-                egui::vec2(right_panel_width, bottom_rect.height()),
-            );
+            let (bottom_left_rect, bottom_right_rect) =
+                split_panel_rects(bottom_rect, LEFT_PANEL_WIDTH, PANEL_GAP);
             let mut encounter_requested = false;
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(bottom_left_rect), |ui| {
                 fixed_group_panel(ui, |ui| {
@@ -918,7 +1087,7 @@ impl eframe::App for UiApp {
         });
 
         if self.cache_access_alert.is_some() {
-            self.show_cache_access_alert(ctx);
+            self.show_cache_access_alert(ctx, &Texts::new(self.language));
             return;
         }
 
@@ -955,6 +1124,44 @@ impl eframe::App for UiApp {
 
         self.show_offset_manager(ctx, &texts);
 
+        // The native Timeleap window is declared by its focused keepalive renderer while
+        // another main tab is active; do not redraw the complete Field screen offscreen.
+        if keep_timeleap_window_viewport(self.tab, self.field.timeleap_search_window_open) {
+            egui::Area::new(egui::Id::new("timeleap-viewport-keepalive"))
+                .fixed_pos(egui::pos2(-20_000.0, -20_000.0))
+                .show(ctx, |ui| {
+                    let field_actions = timeleap_window_keepalive_ui(
+                        ui,
+                        &mut self.field,
+                        FieldUiWorkerState {
+                            search_running: self.jobs.field_generation.is_running(),
+                            pool_generation_running: self.jobs.field_pool_generation.is_running(),
+                            idx_inference_running: self.jobs.field_idx_inference.is_running(),
+                            timeleap_search_running: self
+                                .jobs
+                                .field_timeleap_candidates
+                                .is_running(),
+                            confirmed_target_search_running: self
+                                .jobs
+                                .field_confirmed_target_search
+                                .is_running(),
+                            timeleap_frame1_running: self.jobs.field_timeleap_frame1.is_running(),
+                            timeleap_frame1_preview_running: self
+                                .jobs
+                                .field_timeleap_frame1_preview
+                                .is_running(),
+                        },
+                        ctx,
+                        self.state.fps_value(),
+                        self.wheel_offset_enabled,
+                        self.color_scheme,
+                        &texts,
+                        self.state.fastest_close,
+                    );
+                    self.dispatch_keepalive_window_actions(ctx, field_actions);
+                });
+        }
+
         self.persist_if_changed(ctx);
 
         if self.jobs.generation.is_running()
@@ -963,7 +1170,9 @@ impl eframe::App for UiApp {
             || self.jobs.field_timeline_generation.is_running()
             || self.jobs.field_timeline_extension.is_running()
             || self.jobs.field_idx_inference.is_running()
+            || self.jobs.field_timeleap_shift_resolution.is_running()
             || self.jobs.guidance_generation.is_running()
+            || self.jobs.normal_target_wait.is_running()
             || self.jobs.candidate_reachability.is_running()
             || self.jobs.production_preparation.is_running()
         {
@@ -973,1736 +1182,60 @@ impl eframe::App for UiApp {
 }
 
 impl UiApp {
-    // --- Persisted input snapshot conversion ------------------------------
-
-    fn persisted_state(&self) -> PersistedAppState {
-        PersistedAppState {
-            language: self.language,
-            fps: self.state.fps.clone(),
-            color_scheme: self.color_scheme,
-            beep_enabled: self.beep_enabled,
-            keyboard_enabled: self.keyboard_enabled,
-            candidate_search_sound: self.candidate_search_sound,
-            flash_mode: self.flash_mode,
-            wheel_offset_enabled: self.wheel_offset_enabled,
-            tab: match self.tab {
-                AppTab::Hatch => 0,
-                AppTab::Field => 1,
-                AppTab::NormalTimer => 2,
-                AppTab::Settings => 3,
-            },
-            hatch: PersistedHatch {
-                seed: self.state.seed.clone(),
-                range_start: self.state.range_start.clone(),
-                range_end: self.state.range_end.clone(),
-                range_before_target: self.state.range_before_target.clone(),
-                target: self.state.target.clone(),
-                actual_target_frame: self.state.actual_target_frame.clone(),
-                npc: self.state.npc.clone(),
-                blank_frames: self.state.blank_frames.clone(),
-                encounter_offset: self.state.encounter_offset.clone(),
-                use_offset: self.state.use_offset,
-                rotom_threshold: self.state.rotom_threshold.clone(),
-                consider_rotom_talk: self.state.consider_rotom_talk,
-                consider_pre_rotom_consumption: self.state.consider_pre_rotom_consumption,
-                pre_rotom_consumption: self.state.pre_rotom_consumption.clone(),
-                consider_npc_initial_load: self.state.consider_npc_initial_load,
-                npc_initial_load: self.state.npc_initial_load.clone(),
-                fastest_close: self.state.fastest_close,
-                tolerance: self.state.tolerance.clone(),
-                adjust: self.state.adjust,
-            },
-            field: PersistedField {
-                seed: self.field.seed.clone(),
-                range_start: self.field.range_start.clone(),
-                range_end: self.field.range_end.clone(),
-                range_after_start: self.field.range_after_start.clone(),
-                npc_count: self.field.npc_count.clone(),
-                multiple_npc_search: self.field.multiple_npc_search,
-                initial_branch_scan_span: self.field.initial_branch_scan_span.clone(),
-                target_model: self.field.target_model.clone(),
-                target_mode_known: self.field.target_mode == FieldTargetMode::Known,
-                actual_frame: self.field.actual_frame.clone(),
-                tolerance: self.field.tolerance.clone(),
-                target_consumption: self.field.target_consumption.clone(),
-                encounter_offset: self.field.encounter_offset.clone(),
-                use_offset: self.field.use_offset,
-                table_follow_current: self.field.table_follow_current,
-                adjust: self.field.adjust,
-            },
-            normal_timer: PersistedNormalTimer {
-                wait_frames: self.state.normal_timer.wait_frames.clone(),
-                offsets: self.state.normal_timer.offsets.clone(),
-                offset_enabled: self.state.normal_timer.offset_enabled.clone(),
-            },
-            offsets: self.state.offset_store.clone(),
+    fn dispatch_keepalive_window_actions(
+        &mut self,
+        ctx: &egui::Context,
+        actions: crate::ui::field_view::FieldUiActions,
+    ) {
+        if actions.timeleap_search_cancel_requested {
+            self.jobs.cancel_prepared_timeleap_target();
+            self.jobs.field_timeleap_candidates.cancel();
+            self.jobs.field_timeleap_target_check.cancel_and_discard();
+            self.field.clear_timeleap_candidates();
         }
-    }
-
-    fn apply_persisted_state(&mut self, saved: PersistedAppState) {
-        self.language = saved.language;
-        self.color_scheme = saved.color_scheme;
-        self.beep_enabled = saved.beep_enabled;
-        self.keyboard_enabled = saved.keyboard_enabled;
-        self.candidate_search_sound = saved.candidate_search_sound;
-        self.flash_mode = saved.flash_mode;
-        self.wheel_offset_enabled = saved.wheel_offset_enabled;
-        self.state.fps = saved.fps;
-        self.state.offset_store = saved.offsets;
-
-        let hatch = saved.hatch;
-        self.state.seed = hatch.seed;
-        self.state.range_start = hatch.range_start;
-        self.state.range_end = hatch.range_end;
-        self.state.range_before_target = hatch.range_before_target;
-        self.state.target = hatch.target;
-        self.state.actual_target_frame = hatch.actual_target_frame;
-        self.state.npc = hatch.npc;
-        self.state.blank_frames = hatch.blank_frames;
-        self.state.encounter_offset = hatch.encounter_offset;
-        self.state.use_offset = hatch.use_offset;
-        self.state.rotom_threshold = hatch.rotom_threshold;
-        self.state.consider_rotom_talk = hatch.consider_rotom_talk;
-        self.state.consider_pre_rotom_consumption = hatch.consider_pre_rotom_consumption;
-        self.state.pre_rotom_consumption = hatch.pre_rotom_consumption;
-        self.state.consider_npc_initial_load = hatch.consider_npc_initial_load;
-        self.state.npc_initial_load = hatch.npc_initial_load;
-        self.state.fastest_close = hatch.fastest_close;
-        self.state.tolerance = hatch.tolerance;
-        self.state.adjust = hatch.adjust;
-        self.adjustment_input = hatch.adjust.to_string();
-
-        let field = saved.field;
-        self.field.seed = field.seed;
-        self.field.range_start = field.range_start;
-        self.field.range_end = field.range_end;
-        self.field.range_after_start = field.range_after_start;
-        self.field.npc_count = field.npc_count;
-        self.field.multiple_npc_search = field.multiple_npc_search;
-        self.field.initial_branch_scan_span = field.initial_branch_scan_span;
-        self.field.target_model = if field.target_model.trim().is_empty() {
-            "0".to_string()
-        } else {
-            field.target_model
-        };
-        // フィールドはNPC番号を明示する入力モードだけを使用する。
-        // 保存データを読み込む際も、この指定番号の経路へ正規化する。
-        self.field.target_mode = FieldTargetMode::Known;
-        self.field.actual_frame = field.actual_frame;
-        self.field.tolerance = field.tolerance;
-        self.field.restore_target_input(field.target_consumption);
-        self.field.encounter_offset = field.encounter_offset;
-        self.field.use_offset = field.use_offset;
-        self.field.table_follow_current = field.table_follow_current;
-        self.field.adjust = field.adjust;
-
-        let normal = saved.normal_timer;
-        self.state.normal_timer.wait_frames = normal.wait_frames;
-        self.state.normal_timer.offsets = normal.offsets;
-        self.state.normal_timer.offset_enabled = normal.offset_enabled;
-        while self.state.normal_timer.offset_enabled.len() < self.state.normal_timer.offsets.len() {
-            self.state.normal_timer.offset_enabled.push(true);
+        if actions.timeleap_candidate_search_cancel_requested {
+            self.jobs.field_timeleap_candidates.cancel();
         }
-        self.tab = match saved.tab {
-            1 => AppTab::Field,
-            2 => AppTab::NormalTimer,
-            3 | 4 => AppTab::Settings,
-            _ => AppTab::Hatch,
-        };
-    }
-
-    fn persist_if_changed(&mut self, ctx: &egui::Context) {
-        let current = self.persisted_state();
-        if self.last_saved_state.as_ref() != Some(&current) {
-            self.save_deadline
-                .get_or_insert_with(|| Instant::now() + Duration::from_millis(300));
-            ctx.request_repaint_after(Duration::from_millis(320));
+        if actions.confirmed_target_search_cancel_requested {
+            self.jobs.field_confirmed_target_search.cancel();
         }
-        if self
-            .save_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            current.clone().save();
-            self.last_saved_state = Some(current);
-            self.save_deadline = None;
+        if actions.timeleap_frame1_preview_requested {
+            self.start_field_timeleap_frame1_preview(ctx);
         }
-    }
-
-    fn start_guidance_generation(&mut self, ctx: &egui::Context) {
-        let Some(request) = self.state.guidance_search_request() else {
-            return;
-        };
-        let Some(cache) = self.state.observation_cache.clone() else {
-            return;
-        };
-        let repaint = ctx.clone();
-        self.jobs.guidance_generation.spawn(move || {
-            let fastest_extra = request
-                .fastest_ticks
-                .unwrap_or(0)
-                .max(0)
-                .saturating_mul(request.models as i64)
-                .saturating_add(request.models as i64 + 8);
-            let furthest_start = request
-                .observed_end
-                .saturating_add(request.pre_rotom_consumption)
-                .saturating_add(request.npc_initial_load)
-                .saturating_add(request.offset.unsigned_abs().min(i64::MAX as u64) as i64 / 2)
-                .saturating_add(fastest_extra);
-            let required_end = furthest_start;
-            let results = cache
-                .ensure_through(required_end.min(crate::domain::rng::MAX_SFMT_FRAME), None)
-                .and_then(|()| AppState::calculate_guidance_batch_from_cache(request, &cache));
-            repaint.request_repaint();
-            (request, results)
-        });
-    }
-
-    fn poll_guidance_generation(&mut self) {
-        let Some((_, Ok((request, results)))) = self.jobs.guidance_generation.take_finished()
-        else {
-            return;
-        };
-        // 設定を編集したら到達判定の対応表を消去し、別のSeed・Target・オフセットへ
-        // 古い結果を適用しない。
-        if self
-            .state
-            .guidance_search_request()
-            .is_some_and(|current| current.same_configuration(request))
-        {
-            match results {
-                Ok(results) => self.state.apply_guidance_results(request, results),
-                Err(error) => {
-                    self.present_app_error(error);
-                }
+        if actions.timeleap_reachability_search_requested {
+            self.start_field_timeleap_reachability(ctx);
+        }
+        if let Some(row) = actions.confirmed_target_search_row.as_ref() {
+            if self.field.set_confirmed_target_frame_from_search_row(row) {
+                self.field.prepare_target_research(self.state.fps_value());
             }
         }
-    }
-
-    fn maybe_start_candidate_reachability(&mut self, ctx: &egui::Context) {
-        if self.jobs.candidate_reachability.is_running() {
-            return;
-        }
-        let Some(request) = self.state.candidate_reachability_request() else {
-            self.jobs.candidate_reachability_key = None;
-            return;
-        };
-        if self
-            .jobs
-            .candidate_reachability_key
-            .as_ref()
-            .is_some_and(|key| key == &request)
-        {
-            return;
-        }
-        self.jobs.candidate_reachability_key = Some(request.clone());
-        let observation_cache = self.state.observation_cache.clone();
-        let repaint = ctx.clone();
-        self.jobs.candidate_reachability.spawn(move || {
-            let results = observation_cache
-                .as_ref()
-                .ok_or(AppError::InvalidState(StateIssue::CacheUnavailable))
-                .and_then(|cache| {
-                    let max_candidate = request
-                        .candidate_positions
-                        .iter()
-                        .map(|(_, frame)| *frame)
-                        .max()
-                        .unwrap_or(request.target);
-                    let fastest_extra = request
-                        .fastest_ticks
-                        .unwrap_or(0)
-                        .max(0)
-                        .saturating_mul(request.models as i64)
-                        .saturating_add(request.models as i64 + 8);
-                    let required_end = request
-                        .candidate_positions
-                        .iter()
-                        .map(|(_, frame)| *frame)
-                        .max()
-                        .unwrap_or(max_candidate)
-                        .saturating_add(request.pre_rotom_consumption)
-                        .saturating_add(request.npc_initial_load)
-                        .saturating_add(
-                            request.offset.unsigned_abs().min(i64::MAX as u64) as i64 / 2,
-                        )
-                        .saturating_add(fastest_extra)
-                        .min(crate::domain::rng::MAX_SFMT_FRAME);
-                    cache.ensure_through(required_end, None)?;
-                    AppState::calculate_candidate_reachability_from_cache(request.clone(), cache)
-                });
-            repaint.request_repaint();
-            (request, results)
-        });
-    }
-
-    fn poll_candidate_reachability(&mut self) {
-        let Some((_, Ok((request, results)))) = self.jobs.candidate_reachability.take_finished()
-        else {
-            return;
-        };
-        match results {
-            Ok(results) => self.state.apply_candidate_reachability(&request, &results),
-            Err(error) => {
-                self.present_app_error(error);
-            }
-        }
-    }
-
-    fn maybe_start_production_preparation(&mut self, ctx: &egui::Context) {
-        if !self.state.production_preparation_pending
-            || self.jobs.production_preparation.is_running()
-        {
-            return;
-        }
-        if self.state.target_dirty {
-            return;
-        }
-        let Some((request, cache)) = self.state.production_preparation_request() else {
-            // 範囲外Targetなど、Timeline生成が不要な入力は待機表示にしない。
-            self.state.finish_production_preparation_without_result();
-            return;
-        };
-        let repaint = ctx.clone();
-        self.jobs.production_preparation.spawn(move || {
-            let result = AppState::calculate_production_preparation(request.clone(), cache);
-            repaint.request_repaint();
-            (request, result)
-        });
-    }
-
-    fn poll_production_preparation(&mut self) {
-        let Some((_, worker_result)) = self.jobs.production_preparation.take_finished() else {
-            // `None`は「まだ実行中」。ここでpendingを落とすと、Enter要求が
-            // 計算中のTimelineを使って開始できず、UI表示も準備完了と誤認する。
-            return;
-        };
-        let Ok((request, result)) = worker_result else {
-            self.state.finish_production_preparation_without_result();
-            if self.state.observation_cache.is_none() {
-                self.clear_unused_sfmt_cache_files();
-            }
-            return;
-        };
-        match result {
-            Ok(prepared) => {
-                let applied = self.state.apply_production_preparation(&request, prepared);
-                if !applied && self.state.observation_cache.is_none() {
-                    self.clear_unused_sfmt_cache_files();
-                }
-            }
-            Err(error) => {
-                let still_current = self
-                    .state
-                    .production_preparation_request()
-                    .is_some_and(|(current, _)| current == request);
-                if still_current {
-                    self.state.finish_production_preparation_without_result();
-                    self.present_app_error(error);
-                } else if self.state.observation_cache.is_none() {
-                    self.clear_unused_sfmt_cache_files();
-                }
-            }
-        }
-    }
-
-    fn start_correction_timeline_calculation(&mut self, ctx: &egui::Context) {
-        // 観測間隔は残っているがキャッシュがまだない場合は、補正操作から
-        // 観測Timeline生成も開始する。生成中は補正ボタンをスピナーへ置き換え、
-        // 完了後に候補照合・本番Timeline計算へ続ける。
-        if self.state.candidates.is_empty()
-            && self.state.observation_cache.is_none()
-            && self.state.intervals.len() >= crate::application::state::MIN_BLINK_INTERVALS
-            && !self.jobs.correction_generation.is_running()
-        {
-            let Ok(config) = self.state.search_config() else {
-                return;
-            };
-            self.jobs.correction_generation_key = Some((
-                config.seed,
-                config.range_start,
-                config.range_end,
-                config.fps.to_bits(),
-            ));
-            let repaint = ctx.clone();
-            self.jobs.correction_generation.spawn(move || {
-                let cache = crate::domain::rng::generate_observation_cache(
-                    config.seed,
-                    config.range_start..=config.range_end,
-                    config.target,
-                    config.fps,
-                );
-                repaint.request_repaint();
-                cache
-            });
-        }
-    }
-
-    /// ずれ検証の入口を一つに集約する。ボタンとEnterのどちらからでも
-    /// 同じ条件確認・バックグラウンド計算・ダイアログ表示を行う。
-    fn request_correction(&mut self, ctx: &egui::Context) {
-        let already_in_correction =
-            self.state.session_phase() == crate::application::state::SessionPhase::Correction;
-        // 最速閉じは実測Frame入力前にReadyからFinishedへ移る。通常タイマーも
-        // 終了時にFinishedを使うため、両方の状態から補正を開始できる。
-        if (!already_in_correction && !self.state.can_enter_correction())
-            || !self.state.correction_inputs_complete()
-        {
-            return;
-        }
-        if !already_in_correction {
-            self.state.enter_correction_mode();
-        }
-        if self.state.correction_timeline_needs_calculation() {
-            self.correction_calculating = true;
-            self.start_correction_timeline_calculation(ctx);
-            ctx.request_repaint();
-        } else {
-            self.open_correction_dialog_if_ready();
-        }
-    }
-
-    fn open_correction_dialog_if_ready(&mut self) {
-        // 開始位置は補正欄のドロップダウンで選択する。計算ボタンを押すたびに
-        // その時点の選択値を読み込み、古い候補や最初の候補を再利用しない。
-        let Some(frame) = self.state.selected_correction_start() else {
-            return;
-        };
-        match self.state.correction_preview_from(frame) {
-            Ok(preview) => self.correction_dialog = Some(CorrectionDialog::Confirm { preview }),
-            Err(error @ crate::application::state::CorrectionPreviewError::CacheAccess(_)) => {
-                self.fail_cache_access(error.to_string());
-            }
-            Err(_) => {}
-        }
-    }
-
-    fn apply_correction_offset(&mut self, offset: i64) {
-        self.state.use_offset = true;
-        self.state.encounter_offset = offset.to_string();
-        self.state.recalculate_production();
-    }
-
-    fn apply_correction_rotom(&mut self, correction: crate::application::state::RotomCorrection) {
-        self.state.rotom_threshold = correction.suggested_threshold.to_string();
-        self.state.observed_rotom_talk = Some(correction.observed_talk);
-        self.state.recalculate_production();
-    }
-
-    fn play_beep(&mut self) {
-        self.timer_flash_until =
-            Some(Instant::now() + Duration::from_millis(self.flash_mode.duration_millis()));
-        if !self.beep_enabled {
-            return;
-        }
-        if self.audio.is_none() {
-            self.audio = AudioOutput::open();
-        }
-        if !self.audio.as_ref().is_some_and(AudioOutput::beep) {
-            fallback_candidate_not_found();
-        }
-    }
-
-    fn show_correction_dialog(&mut self, ctx: &egui::Context, texts: &Texts) {
-        let Some(mut dialog) = self.correction_dialog.take() else {
-            return;
-        };
-        let mut keep = true;
-        let title = match &dialog {
-            CorrectionDialog::ConfirmFieldCorrection { .. } => texts.correction_confirmation(),
-            CorrectionDialog::Confirm { .. } => texts.correction_confirmation(),
-        };
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            // 保存されたウィンドウ位置に左右されず、補正ダイアログを画面中央に置く。
-            // 最小幅はidxボタン列が狭い画面でも収まる寸法を確保する。
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .min_width(MIN_WINDOW_WIDTH)
-            .min_height(MIN_WINDOW_HEIGHT)
-            .show(ctx, |ui| match &mut dialog {
-                CorrectionDialog::ConfirmFieldCorrection {
-                    indices,
-                    unknown,
-                    suggested_offset,
-                } => {
-                    ui.label(texts.correction_calculated());
-                    let current_offset = if self.field.use_offset {
-                        self.field
-                            .encounter_offset
-                            .trim()
-                            .parse::<i64>()
-                            .unwrap_or_default()
-                    } else {
-                        0
-                    };
-                    if let Some(offset) = suggested_offset {
-                        let offset_matches = current_offset == *offset;
-                        ui.horizontal(|ui| {
-                            ui.label(texts.offset());
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if offset_matches {
-                                        ui.label("☑");
-                                    } else if ui.button(texts.set()).clicked() {
-                                        self.field.use_offset = true;
-                                        self.field.encounter_offset = offset.to_string();
-                                    }
-                                    ui.label(format!("{}F", offset));
-                                },
-                            );
-                        });
-                    }
-                    ui.separator();
-                    ui.label(texts.model_number());
-                    ui.horizontal(|ui| {
-                        if *unknown {
-                            ui.label("?");
-                        } else {
-                            let current_idx = self.field.target_model.trim().parse::<usize>().ok();
-                            for idx in indices.iter().copied() {
-                                if current_idx == Some(idx) {
-                                    ui.add_enabled(false, egui::Button::new(format!("{idx} ☑")));
-                                } else if ui.button(texts.idx_set(idx)).clicked() {
-                                    self.field.target_model = idx.to_string();
-                                    self.field.target_research_pending = true;
-                                    self.field.mark_timeline_ready();
-                                    self.start_field_search(ctx);
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                    if ui.button(texts.no()).clicked() {
-                        keep = false;
-                    }
-                }
-                CorrectionDialog::Confirm { preview } => {
-                    ui.label(texts.correction_calculated());
-
-                    let rotom = preview.rotom_correction;
-                    let rotom_value = rotom
-                        .map(|value| value.suggested_threshold)
-                        .unwrap_or_else(|| self.state.rotom_threshold_value());
-                    let rotom_matches = rotom.is_none_or(|value| {
-                        self.state.rotom_threshold_value() == value.suggested_threshold
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(texts.rotom_chatter_label());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if rotom_matches {
-                                ui.label("☑");
-                            } else if let Some(correction) = rotom {
-                                if ui.button(texts.set()).clicked() {
-                                    self.apply_correction_rotom(correction);
-                                }
-                            }
-                            ui.label(format!("{}%", rotom_value));
-                        });
-                    });
-
-                    let current_offset = if self.state.use_offset {
-                        self.state
-                            .encounter_offset
-                            .trim()
-                            .parse::<i64>()
-                            .unwrap_or_default()
-                    } else {
-                        0
-                    };
-                    let offset_matches = current_offset == preview.suggested_offset;
-                    ui.horizontal(|ui| {
-                        ui.label(texts.offset());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if offset_matches {
-                                ui.label("☑");
-                            } else if ui.button(texts.set()).clicked() {
-                                self.apply_correction_offset(preview.suggested_offset);
-                            }
-                            ui.label(format!("{}F", preview.suggested_offset));
-                        });
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label(texts.timeline_reachability());
-                        ui.label(format!("(Start:{}F)", preview.timeline_start));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(texts.target_actual_reachability(
-                            preview.target_on_timeline,
-                            preview.actual_on_timeline,
-                        ));
-                    });
-
-                    if ui.button(texts.no()).clicked() {
-                        keep = false;
-                    }
-                }
-            });
-        self.correction_dialog = keep.then_some(dialog);
-    }
-
-    fn show_cache_access_alert(&mut self, ctx: &egui::Context) {
-        let Some(details) = self.cache_access_alert.clone() else {
-            return;
-        };
-        let mut dismiss = false;
-        egui::Window::new("キャッシュフォルダにアクセスできません")
-            .id(egui::Id::new("cache_access_alert"))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label("SFMTキャッシュを利用できないため、処理を中断しました。");
-                ui.label("キャッシュフォルダへのアクセス権や空き容量を確認してください。");
-                ui.separator();
-                ui.label(details);
-                ui.add_space(8.0);
-                if ui.button("閉じる").clicked() {
-                    dismiss = true;
-                }
-            });
-        if dismiss {
-            self.cache_access_alert = None;
-        }
-    }
-
-    fn fail_cache_access(&mut self, details: impl Into<String>) {
-        self.cache_access_alert = Some(details.into());
-        self.state.cancel_observation();
-        self.field.cancel_observation();
-        self.cancel_observation_generation();
-        self.cancel_field_background_tasks();
-        self.correction_calculating = false;
-        self.correction_dialog = None;
-        self.field_timer_retry = false;
-        self.beeps.article.clear();
-        self.beeps.article_start = None;
-    }
-
-    fn play_candidate_confirmed(&mut self) {
-        if !self.beep_enabled || !self.candidate_search_sound {
-            return;
-        }
-        if self.audio.is_none() {
-            self.audio = AudioOutput::open();
-        }
-        if !self
-            .audio
-            .as_ref()
-            .is_some_and(AudioOutput::candidate_confirmed)
-        {
-            fallback_beep();
-        }
-    }
-
-    fn play_candidate_not_found(&mut self) {
-        if !self.beep_enabled || !self.candidate_search_sound {
-            return;
-        }
-        if self.audio.is_none() {
-            self.audio = AudioOutput::open();
-        }
-        if !self
-            .audio
-            .as_ref()
-            .is_some_and(AudioOutput::candidate_not_found)
-        {
-            fallback_candidate_not_found();
-        }
-    }
-
-    /// フィールド観測をリセットしたとき、検索ワーカーへキャンセルを通知して破棄する。
-    /// 生成・照合中も共有トークンを確認するため、キャンセル後にCPUを使い続けたり、
-    /// 長い検索の完了まで入力を無効にしたりしない。
-    fn cancel_field_background_tasks(&mut self) {
-        self.jobs.cancel_field_session();
-        self.beeps.field.clear();
-        self.beeps.field_start = None;
-    }
-
-    fn clear_unused_sfmt_cache_files(&self) {
-        crate::infrastructure::cache_store::CacheStore::default().clear_unused_files();
-    }
-
-    fn toggle_normal_timer(&mut self) {
-        if self.state.normal_timer.is_running() {
-            self.state.normal_timer.stop();
-            self.beeps.normal.clear();
-            return;
-        }
-
-        if self
-            .state
-            .normal_timer
-            .start(self.state.fps_value())
-            .is_ok()
-        {
-            self.schedule_normal_timer_beeps();
-        }
-    }
-
-    fn retry_field_timer_if_needed(&mut self, ctx: &egui::Context) {
-        if !self.field_timer_retry || self.field.timer_is_running() || self.field.results.len() != 1
-        {
-            return;
-        }
-        if self.field.start_blink_timer(self.state.fps_value()).is_ok() {
-            self.field_timer_retry = false;
-        } else if self.jobs.field_timeline_extension_blocked {
-            // 上限到達なら範囲外として停止し、計算失敗ならそのエラーを表示する。
-            self.field_timer_retry = false;
-            if let Some(message) = self.jobs.field_timeline_extension_error.take() {
-                self.present_app_error_ref(&message);
-            } else {
-                self.field.stop_blink_timer_out_of_range();
-            }
-        } else {
-            // Timeline延長のワーカーがまだ終わっていない。短い間隔で
-            // 再試行し、タイマーと通知音を停止状態のまま放置しない。
-            ctx.request_repaint_after(Duration::from_millis(50));
-        }
-    }
-
-    fn tick_normal_timer(&mut self, ctx: &egui::Context) {
-        self.tick_normal_timer_at(ctx, Instant::now());
-    }
-
-    fn tick_normal_timer_at(&mut self, ctx: &egui::Context, now: Instant) {
-        let due = BeepScheduler::drain_due(&mut self.beeps.normal, now);
-        for _ in 0..due {
-            self.play_beep();
-        }
-
-        while self.state.normal_timer.is_running()
-            && self.state.normal_timer.remaining_at(now) <= 0.0
-        {
-            let due = BeepScheduler::drain_due(&mut self.beeps.normal, now);
-            for _ in 0..due {
-                self.play_beep();
-            }
-            let advanced = self
-                .state
-                .normal_timer
-                .advance_segment_at(self.state.fps_value(), now);
-            self.beeps.normal.clear();
-            if !advanced {
-                break;
-            }
-            self.schedule_normal_timer_beeps();
-            let due = BeepScheduler::drain_due(&mut self.beeps.normal, now);
-            for _ in 0..due {
-                self.play_beep();
-            }
-        }
-
-        if self.state.normal_timer.is_running() || !self.beeps.normal.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(50));
-        }
-    }
-
-    fn normal_beep_parameters(&self) -> (u32, f64) {
-        let count = self
-            .state
-            .beep_count
-            .trim()
-            .parse::<u32>()
-            .unwrap_or(1)
-            .max(1);
-        let interval = self
-            .state
-            .beep_interval
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(1.0);
-        (count, interval)
-    }
-
-    fn schedule_normal_timer_beeps(&mut self) {
-        let Some(start) = self.state.normal_timer.timer_start else {
-            self.beeps.normal.clear();
-            return;
-        };
-        self.beeps.normal =
-            self.schedule_segment_beeps(Some(start), self.state.normal_timer.timer_seconds);
-    }
-
-    fn ensure_article_beep_schedule(&mut self) {
-        if !self.state.is_countdown() {
-            return;
-        }
-        let Some(start) = self.state.article_timer_start_time() else {
-            return;
-        };
-        if self.beeps.article_start == Some(start) {
-            return;
-        }
-        self.beeps.article_start = Some(start);
-        self.beeps.article =
-            self.schedule_segment_beeps(Some(start), self.state.article_timer_seconds_value());
-    }
-
-    fn ensure_field_beep_schedule(&mut self) {
-        let Some(start) = self.field.timer_start_time() else {
-            return;
-        };
-        if self.beeps.field_start == Some(start) {
-            return;
-        }
-        self.beeps.field_start = Some(start);
-        // フィールド観測のbeepは予測瞬きそのものを示すため常に1回とする。
-        // 設定した回数はTargetタイマーなど長いカウントダウンだけで使う。
-        let (count, interval) = match self.field.timer_kind() {
-            FieldTimerKind::NextBlink => (1, self.normal_beep_parameters().1),
-            FieldTimerKind::Target => self.normal_beep_parameters(),
-        };
-        self.beeps.field = self.schedule_segment_beeps_with_parameters(
-            Some(start),
-            self.field.timer_seconds_value(),
-            count,
-            interval,
-        );
-    }
-
-    fn schedule_segment_beeps(
-        &self,
-        start: Option<Instant>,
-        duration_seconds: f64,
-    ) -> Vec<Instant> {
-        let (count, interval) = self.normal_beep_parameters();
-        self.schedule_segment_beeps_with_parameters(start, duration_seconds, count, interval)
-    }
-
-    fn schedule_segment_beeps_with_parameters(
-        &self,
-        start: Option<Instant>,
-        duration_seconds: f64,
-        count: u32,
-        interval: f64,
-    ) -> Vec<Instant> {
-        let Some(start) = start else {
-            return Vec::new();
-        };
-        let duration_seconds = if duration_seconds.is_finite() {
-            duration_seconds.max(0.0)
-        } else {
-            0.0
-        };
-        beep_offsets_for_segment(duration_seconds, count, interval)
-            .into_iter()
-            .map(|offset| start + Duration::from_secs_f64(offset))
-            .collect()
-    }
-
-    fn open_offset_manager(&mut self, scope: OffsetScope) {
-        self.offset_manager = Some(OffsetManagerState {
-            scope,
-            value: "0".into(),
-            memo: String::new(),
-            editing: None,
-            notice: String::new(),
-        });
-    }
-
-    fn show_offset_manager(&mut self, ctx: &egui::Context, texts: &Texts) {
-        let Some(mut manager) = self.offset_manager.take() else {
-            return;
-        };
-        let wheel_offset_enabled = self.wheel_offset_enabled;
-        let mut open = true;
-        let title = match manager.scope {
-            OffsetScope::Hatch => texts.hatch_offset_manager(),
-            OffsetScope::Field => texts.field_offset_manager(),
-            OffsetScope::Normal => texts.normal_offset_manager(),
-        };
-        egui::Window::new(title)
-            .open(&mut open)
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(texts.offset_frame());
-                    frame_spinner(ui, &mut manager.value, 100.0, 2, wheel_offset_enabled);
-                });
-                ui.horizontal(|ui| {
-                    ui.label(texts.memo());
-                    ui.add(egui::TextEdit::singleline(&mut manager.memo).desired_width(260.0));
-                    let editing = manager.editing.is_some();
-                    if ui
-                        .button(if editing { texts.update() } else { texts.add() })
-                        .clicked()
-                    {
-                        match manager.value.trim().parse::<i64>() {
-                            Ok(value) => {
-                                let entry = SavedOffset {
-                                    value,
-                                    memo: manager.memo.trim().to_string(),
-                                };
-                                let entries = match manager.scope {
-                                    OffsetScope::Hatch => &mut self.state.offset_store.hatch,
-                                    OffsetScope::Field => &mut self.state.offset_store.field,
-                                    OffsetScope::Normal => &mut self.state.offset_store.normal,
-                                };
-                                if let Some(index) = manager.editing {
-                                    if let Some(existing) = entries.get_mut(index) {
-                                        *existing = entry;
-                                    }
-                                } else {
-                                    entries.push(entry);
-                                }
-                                match self.state.offset_store.save() {
-                                    Ok(()) => {
-                                        manager.notice.clear();
-                                        manager.value = "0".into();
-                                        manager.memo.clear();
-                                        manager.editing = None;
-                                    }
-                                    Err(error) => manager.notice = error.to_string(),
-                                }
-                            }
-                            Err(_) => {
-                                manager.notice = "オフセットFrameは整数で入力してください。".into()
-                            }
-                        }
-                    }
-                    if editing && ui.button(texts.stop_editing()).clicked() {
-                        manager.editing = None;
-                        manager.value = "0".into();
-                        manager.memo.clear();
-                    }
-                });
-                ui.separator();
-
-                let entries = match manager.scope {
-                    OffsetScope::Hatch => self.state.offset_store.hatch.clone(),
-                    OffsetScope::Field => self.state.offset_store.field.clone(),
-                    OffsetScope::Normal => self.state.offset_store.normal.clone(),
-                };
-                let mut action = None;
-                for (index, entry) in entries.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.add_sized([70.0, 20.0], egui::Label::new(format!("{}F", entry.value)));
-                        ui.add_sized(
-                            [260.0, 20.0],
-                            egui::Label::new(if entry.memo.is_empty() {
-                                texts.no_memo()
-                            } else {
-                                entry.memo.as_str()
-                            }),
-                        );
-                        if ui.button(texts.apply()).clicked() {
-                            action = Some(OffsetAction::Apply(entry.value));
-                        }
-                        if ui.button(texts.edit()).clicked() {
-                            action = Some(OffsetAction::Edit(index));
-                        }
-                        if ui.button(texts.delete()).clicked() {
-                            action = Some(OffsetAction::Delete(index));
-                        }
-                    });
-                }
-
-                if let Some(action) = action {
-                    match action {
-                        OffsetAction::Apply(value) => match manager.scope {
-                            OffsetScope::Hatch => {
-                                if self.state.is_timer_phase() || self.state.is_finished() {
-                                    manager.notice = "本番中はオフセットを反映できません。".into();
-                                } else {
-                                    self.state.use_offset = true;
-                                    self.state.encounter_offset = value.to_string();
-                                    self.state.recalculate_production();
-                                    manager.notice.clear();
-                                }
-                            }
-                            OffsetScope::Field => {
-                                if self.field.timer_is_running() {
-                                    manager.notice = "タイマー停止中のみ反映できます。".into();
-                                } else {
-                                    self.field.use_offset = true;
-                                    self.field.encounter_offset = value.to_string();
-                                    self.field
-                                        .refresh_target_timer_for_offset(self.state.fps_value());
-                                    manager.notice.clear();
-                                }
-                            }
-                            OffsetScope::Normal => {
-                                if self.state.normal_timer.is_running() {
-                                    manager.notice = "タイマー停止中のみ反映できます。".into();
-                                } else {
-                                    self.state.normal_timer.offsets.push(value.to_string());
-                                    self.state.normal_timer.offset_enabled.push(true);
-                                    manager.notice.clear();
-                                }
-                            }
-                        },
-                        OffsetAction::Edit(index) => {
-                            if let Some(entry) = entries.get(index) {
-                                manager.value = entry.value.to_string();
-                                manager.memo = entry.memo.clone();
-                                manager.editing = Some(index);
-                            }
-                        }
-                        OffsetAction::Delete(index) => {
-                            let entries = match manager.scope {
-                                OffsetScope::Hatch => &mut self.state.offset_store.hatch,
-                                OffsetScope::Field => &mut self.state.offset_store.field,
-                                OffsetScope::Normal => &mut self.state.offset_store.normal,
-                            };
-                            if index < entries.len() {
-                                entries.remove(index);
-                                manager.editing = None;
-                                match self.state.offset_store.save() {
-                                    Ok(()) => manager.notice.clear(),
-                                    Err(error) => manager.notice = error.to_string(),
-                                }
-                            }
-                        }
-                    }
-                }
-                if !manager.notice.is_empty() {
-                    let notice = texts.notice(&manager.notice);
-                    ui.colored_label(self.color_scheme.colors_for_ui(ui).error, notice);
-                }
-            });
-        if open {
-            self.offset_manager = Some(manager);
-        }
-    }
-
-    fn record_hatch_blink(&mut self) {
-        if !self.state.is_observing() {
-            return;
-        }
-        let was_exhausted = self.state.search_exhausted;
-        self.state.observe();
-        if !was_exhausted && self.state.search_exhausted {
-            self.play_candidate_not_found();
-        }
-    }
-
-    fn record_field_blink(&mut self, ctx: &egui::Context) {
-        if !self.field.is_observation_input_enabled() || self.jobs.field_idx_inference.is_running()
-        {
-            return;
-        }
-        if self.field.search_exhausted {
-            return;
-        }
-        // 初回検索で候補が得られた後は、StartingFrameから全Timelineを作り直さず
-        // 次の瞬き1回分だけ候補を延長する。初回検索中は再利用可能な状態がないため、
-        // 再検索要求として扱う。
-        let had_candidates = !self.field.results.is_empty();
-        let search_running = self.jobs.field_generation.is_running();
-        let previous_interval_count = self.field.intervals.len();
-        self.field.observe(self.state.fps_value());
-        if had_candidates && !search_running && previous_interval_count >= 2 {
-            let expected = self.field.intervals.last().copied().unwrap_or_default();
-            let survivors = self.field.advance_candidates_by_interval(expected);
-            self.field.search_exhausted = survivors == 0;
-            if survivors == 0 {
+        if let Some(frame1) = actions.timeleap_frame1_offset_frame {
+            if self
+                .field
+                .apply_timeleap_frame1_offset(frame1, self.state.fastest_close)
+                .is_some()
+            {
                 self.field
-                    .set_candidate_not_found_notice("候補が見つかりません");
-                self.play_candidate_not_found();
-            } else if survivors == 1 {
-                self.field.mark_timeline_ready();
-                if self.field.can_start_timer() {
-                    match self.field.start_blink_timer(self.state.fps_value()) {
-                        Ok(()) => {
-                            self.play_candidate_confirmed();
-                        }
-                        Err(_) => {
-                            self.field_timer_retry = true;
-                            ctx.request_repaint_after(Duration::from_millis(50));
-                        }
-                    }
-                }
-            }
-        } else {
-            if had_candidates {
-                self.field.invalidate_search_results();
-            }
-            if self.field.intervals.len() >= 2 && !search_running {
-                self.start_field_search(ctx);
-            } else if search_running {
-                self.jobs.field_search_needs_restart = true;
+                    .refresh_target_timer_for_offset(self.state.fps_value());
             }
         }
-    }
-
-    fn start_observation_and_generation(&mut self, ctx: &egui::Context) {
-        if self.jobs.generation.is_running() {
-            return;
-        }
-        let config = match self.state.search_config() {
-            Ok(config) => config,
-            Err(_) => {
-                return;
-            }
-        };
-        // 起動時の準備に失敗していた環境では、観測開始時に再試行する。
-        if self.beep_enabled && self.audio.is_none() {
-            self.audio = AudioOutput::open();
-        }
-        self.state.start_observation_pending();
-        let repaint = ctx.clone();
-        self.jobs.generation.spawn_cancellable(move |cancel| {
-            let cache = crate::domain::rng::generate_observation_cache_cancelable(
-                config.seed,
-                config.range_start..=config.range_end,
-                config.target,
-                config.fps,
-                Some(cancel.as_ref()),
-            );
-            repaint.request_repaint();
-            cache
-        });
-    }
-
-    fn cancel_observation_generation(&self) {
-        self.jobs.generation.cancel();
-    }
-
-    fn poll_generation(&mut self) {
-        let Some((_, result)) = self.jobs.generation.take_finished() else {
-            return;
-        };
-        match result {
-            Ok(Ok(cache)) => {
-                if !self.state.is_observing() {
-                    // クリックでキャンセルした検索が次のフレームで完了することがある。
-                    // その結果を待機画面へ再適用しない。
-                    return;
-                }
-                self.state.apply_observation_cache(cache);
-                self.state.rematch_observations();
-                if self.state.search_exhausted {
-                    self.play_candidate_not_found();
-                }
-            }
-            Ok(Err(message)) => {
-                if self.state.is_observing() {
-                    self.present_app_error(message);
-                }
-            }
-            Err(_) => {}
-        }
-    }
-
-    fn poll_field_generation(&mut self, ctx: &egui::Context) {
-        let Some((cancelled, result)) = self.jobs.field_generation.take_finished() else {
-            return;
-        };
-        if cancelled {
-            return;
-        }
-        match result {
-            Ok(Ok((outcome, pool))) => {
-                if self.jobs.field_search_needs_restart {
-                    self.jobs.field_search_needs_restart = false;
-                    self.field.set_observation_cache(pool.timeline_cache());
-                    self.jobs.field_pool = Some(pool);
-                    if self.field.is_observing()
-                        && self.field.intervals.len()
-                            >= crate::application::state::MIN_BLINK_INTERVALS
-                    {
-                        self.start_field_search(ctx);
-                    }
-                    return;
-                }
-                if !self.field.accepts_search_result() {
-                    // キャンセルはクリック操作だけで行う。実行中の検索結果を
-                    // キャンセル済みセッションへ再適用しない。
-                    // Targetだけの再評価は、既存の瞬きタイマーを動かしたまま別経路で受け付ける。
-                    return;
-                }
-                self.field.set_observation_cache(pool.timeline_cache());
-                self.jobs.field_pool = Some(pool);
-                // Targetだけの再評価で観測候補を置き換えない。Timeline、開始位置、remain状態、
-                // 観測アンカーはTargetから独立しており、到達可否とTargetまでの時間だけを更新する。
-                if self.field.target_research_pending && self.field.results.len() == 1 {
-                    let selected_key =
-                        self.field
-                            .results
-                            .get(self.field.selected_result)
-                            .map(|result| {
-                                (
-                                    result.start_consumption,
-                                    result.models,
-                                    result.observed_model,
-                                )
-                            });
-                    if let (Some(current), Some(refined)) = (
-                        self.field.results.get_mut(self.field.selected_result),
-                        outcome.results.iter().find(|result| {
-                            selected_key.is_some_and(|key| {
-                                key == (
-                                    result.start_consumption,
-                                    result.models,
-                                    result.observed_model,
-                                )
-                            })
-                        }),
-                    ) {
-                        current.target_wait_frame = refined.target_wait_frame;
-                        current.target_exact = refined.target_exact;
-                        current.target_frame_before = refined.target_frame_before;
-                        current.target_frame_after = refined.target_frame_after;
-                        current.target_blink_count = refined.target_blink_count;
-                    }
-                    self.field.target_research_pending = false;
-                    self.field.search_exhausted = false;
-                    self.field.clear_notice();
-                    // 観測済みTimelineは変わらないため、瞬きタイマーと候補確定音を再開しない。
-                    return;
-                }
-                self.field.target_research_pending = false;
-                self.field.results = self.field.normalize_search_results(outcome.results);
-                self.field.search_exhausted = self.field.results.is_empty();
-                self.jobs.field_timeline_extension_blocked = false;
-                self.jobs.field_timeline_extension_error = None;
-                self.field.idx_fallback_indices.clear();
-                self.field.table_last_followed_row = None;
-                self.field.refresh_nearest_timeline_frame();
-                if self.field.results.is_empty() {
-                    self.play_candidate_not_found();
-                }
-                if self.field.results.is_empty() {
-                    self.field
-                        .set_candidate_not_found_notice("候補が見つかりません");
-                } else if self.field.results.len() == 1 {
-                    self.field.mark_timeline_ready();
-                }
-                if self.field.results.len() == 1 {
-                    // Enter/ずれ検証後は、遅れて届いた検索結果でも
-                    // タイマーや候補確定音を再開しない。リセットでのみ
-                    // 新しい観測セッションへ戻る。
-                    if self.field.is_correction_mode() {
-                        return;
-                    }
-                    // Timelineが一意になったら瞬き合わせのカウントダウンを開始する。
-                    // 先読みキューが空などの理由でタイマーを開始できない場合は、
-                    // 確定音だけが先に鳴らないよう、タイマー開始後に通知する。
-                    if self.field.can_start_timer() {
-                        match self.field.start_blink_timer(self.state.fps_value()) {
-                            Ok(()) => {
-                                self.play_candidate_confirmed();
-                            }
-                            Err(AppError::InvalidState(StateIssue::TimelineLimitReached)) => {
-                                self.field_timer_retry = false;
-                            }
-                            Err(_) => {
-                                // 先読み末尾へ到達した場合は、次のチャンクをバックグラウンド
-                                // で追加してから同じ候補のタイマー開始を再試行する。
-                                self.field_timer_retry = true;
-                                ctx.request_repaint_after(Duration::from_millis(50));
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(Err(message)) => {
-                self.field.target_research_pending = false;
-                self.present_app_error(message);
-            }
-            Err(_) => {
-                self.field.target_research_pending = false;
+        if let Some(drift_frames) = actions.confirmed_target_offset_drift_frames {
+            if self
+                .field
+                .apply_timeleap_offset_drift(drift_frames, self.state.fastest_close)
+                .is_some()
+            {
+                self.field
+                    .refresh_target_timer_for_offset(self.state.fps_value());
             }
         }
-    }
-
-    fn poll_field_target_generation(&mut self, ctx: &egui::Context) {
-        let Some((cancelled, joined)) = self.jobs.field_target_generation.take_finished() else {
-            return;
-        };
-        if cancelled {
-            return;
+        if actions.confirmed_target_search_requested {
+            self.start_field_confirmed_target_search(ctx);
         }
-        let Ok((key, result)) = joined else {
-            self.field.target_research_pending = false;
-            return;
-        };
-        let current_target = self.field.target_consumption.trim().parse::<i64>().ok();
-        let current_seed =
-            u32::from_str_radix(self.field.seed.trim().trim_start_matches("0x"), 16).ok();
-        let candidate_matches = self
-            .field
-            .results
-            .get(self.field.selected_result)
-            .is_some_and(|candidate| {
-                current_seed.is_some_and(|seed| {
-                    current_target.is_some_and(|target| key.matches_result(seed, target, candidate))
-                })
-            });
-
-        if !candidate_matches {
-            if self.field.target_research_pending {
-                self.start_field_target_research(ctx);
-            }
-            return;
+        if actions.timeleap_search_requested {
+            self.request_field_timeleap_candidate_search(ctx);
         }
-
-        match result {
-            Ok(refined) => {
-                if let Some(current) = self.field.results.get_mut(self.field.selected_result) {
-                    current.target_wait_frame = refined.target_wait_frame;
-                    current.target_exact = refined.target_exact;
-                    current.target_frame_before = refined.target_frame_before;
-                    current.target_frame_after = refined.target_frame_after;
-                    current.target_blink_count = refined.target_blink_count;
-                }
-                self.field.target_research_pending = false;
-                self.field.search_exhausted = false;
-                self.field.clear_notice();
-            }
-            Err(AppError::Cancelled) => {}
-            Err(error) => {
-                self.field.target_research_pending = false;
-                self.present_app_error(error);
-            }
-        }
-    }
-
-    fn poll_field_pool_generation(&mut self, _ctx: &egui::Context) {
-        let Some((cancelled, result)) = self.jobs.field_pool_generation.take_finished() else {
-            return;
-        };
-        if cancelled {
-            return;
-        }
-        match result {
-            Ok(Ok(pool)) => {
-                if self.field.is_observing() {
-                    self.jobs.field_pool = Some(pool);
-                }
-            }
-            Ok(Err(message)) => {
-                self.present_app_error(message);
-            }
-            Err(_) => {}
-        }
-    }
-
-    /// SFMTプール完成後のTimeline索引を別ワーカーで先行生成する。
-    ///
-    /// この処理は観測入力や検索ワーカーと同じJoinHandleへ入れない。観測中に
-    /// 完了すれば検索で再利用でき、間に合わない場合でも検索自体は詳細照合へ
-    /// 進められる。リセット／検索開始時にはキャンセルして古い索引を破棄する。
-    #[allow(dead_code)]
-    fn start_field_timeline_generation(&mut self, ctx: &egui::Context) {
-        if self.jobs.field_timeline_generation.is_running() {
-            return;
-        }
-        let Some(pool) = self.jobs.field_pool.as_ref() else {
-            return;
-        };
-        let Ok(configs) = self.field.configs() else {
-            return;
-        };
-        let cache = pool.timeline_cache();
-        let repaint = ctx.clone();
-        self.jobs
-            .field_timeline_generation
-            .spawn_cancellable(move |cancel| {
-                let result = crate::application::field::prepare_timeline_warmup_cancelable(
-                    &cache,
-                    &configs,
-                    Some(cancel.as_ref()),
-                );
-                repaint.request_repaint();
-                result
-            });
-    }
-
-    fn poll_field_timeline_generation(&mut self) {
-        let Some((cancelled, result)) = self.jobs.field_timeline_generation.take_finished() else {
-            return;
-        };
-        if cancelled {
-            return;
-        }
-        match result {
-            Ok(Ok(index)) => {
-                if self.field.is_observing() {
-                    if let Some(pool) = self.jobs.field_pool.as_mut() {
-                        pool.install_timeline(index);
-                    }
-                }
-            }
-            Ok(Err(message)) => {
-                // Timeline索引は先行最適化なので、失敗しても詳細検索は継続する。
-                self.present_app_error(message);
-            }
-            Err(_) => {}
-        }
-    }
-
-    /// 一意候補のTimeline延長はModelStatusとSFMTを進めるため、UIスレッドで
-    /// 実行しない。表示履歴には上限があり、ワーカーのスナップショットが履歴全体と
-    /// ともに肥大化しないようにする。
-    fn start_field_timeline_extension(&mut self, ctx: &egui::Context) {
-        if self.jobs.field_timeline_extension.is_running()
-            || self.jobs.field_timeline_extension_blocked
-            || !self.field.timeline_extension_needed(self.state.fps_value())
-        {
-            return;
-        }
-        if let Err(error) = self.field.prepare_shared_timeline_cache() {
-            self.jobs.field_timeline_extension_blocked = true;
-            let error = Arc::new(error);
-            self.jobs.field_timeline_extension_error = Some(error.clone());
-            self.present_app_error_ref(&error);
-            return;
-        }
-        let Some(result) = self.field.results.get(self.field.selected_result) else {
-            return;
-        };
-        let key = (
-            self.field.selected_result,
-            result.start_consumption,
-            result.last_wait_frame,
-        );
-        let snapshot = self.field.clone();
-        let fps = self.state.fps_value();
-        let repaint = ctx.clone();
-        self.jobs.field_timeline_extension_key = Some(key);
-        self.jobs.field_timeline_extension.spawn(move || {
-            let mut extended = snapshot;
-            let can_continue = extended.extend_timeline_if_needed(fps);
-            repaint.request_repaint();
-            (extended, can_continue)
-        });
-    }
-
-    fn poll_field_timeline_extension(&mut self) {
-        let Some((_, result)) = self.jobs.field_timeline_extension.take_finished() else {
-            return;
-        };
-        let key = self.jobs.field_timeline_extension_key.take();
-        let Ok((extended, can_continue)) = result else {
-            self.jobs.field_timeline_extension_blocked = true;
-            let error = Arc::new(AppError::WorkerPanicked);
-            self.jobs.field_timeline_extension_error = Some(error.clone());
-            self.present_app_error_ref(&error);
-            return;
-        };
-        let current_key = self
-            .field
-            .results
-            .get(self.field.selected_result)
-            .map(|result| {
-                (
-                    self.field.selected_result,
-                    result.start_consumption,
-                    result.last_wait_frame,
-                )
-            });
-        if !self.field.is_correction_mode() && key.is_some() && key == current_key {
-            match can_continue {
-                Ok(can_continue) => {
-                    self.field.apply_timeline_extension(extended);
-                    self.jobs.field_timeline_extension_blocked = !can_continue;
-                    self.jobs.field_timeline_extension_error = None;
-                }
-                Err(message) => {
-                    self.jobs.field_timeline_extension_blocked = true;
-                    let message = Arc::new(message);
-                    self.jobs.field_timeline_extension_error = Some(message.clone());
-                    self.present_app_error_ref(&message);
-                }
-            }
-        }
-    }
-
-    fn poll_field_idx_inference(&mut self, _ctx: &egui::Context) {
-        let Some((cancelled, result)) = self.jobs.field_idx_inference.take_finished() else {
-            return;
-        };
-        if cancelled {
-            return;
-        }
-        match result {
-            Ok(Ok(inference)) => {
-                if self.field.intervals.len() < crate::application::state::MIN_BLINK_INTERVALS {
-                    return;
-                }
-                self.field.inferred_indices = inference.indices.clone();
-                self.field.correction_calculated = true;
-                self.field.correction_suggested_offset = inference.suggested_offset;
-                let unknown = inference.indices.is_empty() || inference.indices.len() > 5;
-                self.correction_dialog = Some(CorrectionDialog::ConfirmFieldCorrection {
-                    indices: if unknown {
-                        Vec::new()
-                    } else {
-                        inference.indices
-                    },
-                    unknown,
-                    suggested_offset: inference.suggested_offset,
-                });
-                self.field.clear_notice();
-            }
-            Ok(Err(message)) => {
-                self.present_app_error(message);
-            }
-            Err(_) => {}
-        }
-    }
-
-    fn cancel_field_idx_inference(&mut self) {
-        self.jobs.cancel_field_idx_inference();
-    }
-
-    fn start_field_pool_generation(&mut self, ctx: &egui::Context) {
-        if self.jobs.field_pool_generation.is_running() {
-            return;
-        }
-        let configs = match self.field.configs() {
-            Ok(configs) => configs,
-            Err(message) => {
-                self.field.set_search_range_notice(message.to_string());
-                return;
-            }
-        };
-        let repaint = ctx.clone();
-        self.jobs
-            .field_pool_generation
-            .spawn_cancellable(move |cancel| {
-                let result = crate::application::field::prepare_search_pool_with_configs_cancelable(
-                    &configs,
-                    Some(cancel.as_ref()),
-                );
-                repaint.request_repaint();
-                result
-            });
-    }
-
-    fn start_field_idx_inference(&mut self, ctx: &egui::Context) {
-        if self.jobs.field_idx_inference.is_running() || self.field.timer_is_running() {
-            return;
-        }
-        let Ok(configs) = self.field.configs() else {
-            return;
-        };
-        let Ok(actual_frame) = self.field.actual_frame.trim().parse::<i64>() else {
-            return;
-        };
-        let Some(selected) = self.field.results.get(self.field.selected_result).cloned() else {
-            return;
-        };
-        let Some(seed) = configs.first().map(|config| config.seed) else {
-            return;
-        };
-        let tolerance = configs.first().map(|config| config.tolerance).unwrap_or(0);
-        let target = configs.first().and_then(|config| config.target_consumption);
-        let current_offset = if self.field.use_offset {
-            self.field
-                .encounter_offset
-                .trim()
-                .parse::<i64>()
-                .unwrap_or_default()
-        } else {
-            0
-        };
-        if actual_frame < 0 || self.field.results.len() != 1 {
-            return;
-        }
-        if self.field.correction_calculated {
-            let indices = self.field.inferred_indices.clone();
-            let unknown = indices.is_empty() || indices.len() > 5;
-            self.correction_dialog = Some(CorrectionDialog::ConfirmFieldCorrection {
-                indices: if unknown { Vec::new() } else { indices },
-                unknown,
-                suggested_offset: self.field.correction_suggested_offset,
-            });
-            return;
-        }
-        self.field.idx_fallback_indices.clear();
-        let repaint = ctx.clone();
-        let observation_cache = self
-            .jobs
-            .field_pool
-            .as_ref()
-            .map(|pool| pool.timeline_cache());
-        self.jobs
-            .field_idx_inference
-            .spawn_cancellable(move |cancel| {
-                let result = crate::application::field::infer_idx_from_result_with_cache_cancelable(
-                    seed,
-                    &selected,
-                    tolerance,
-                    actual_frame,
-                    observation_cache.as_ref(),
-                    Some(cancel.as_ref()),
-                );
-                let Ok(mut inference) = result else {
-                    repaint.request_repaint();
-                    return result;
-                };
-                inference.suggested_offset = target.and_then(|target| {
-                crate::application::field::suggest_field_offset_from_result_with_cache_cancelable(
-                    seed,
-                    &selected,
-                    target,
-                    actual_frame,
-                    current_offset,
-                    observation_cache.as_ref(),
-                    Some(cancel.as_ref()),
-                )
-                .ok()
-                .flatten()
-            });
-                repaint.request_repaint();
-                Ok(inference)
-            });
-    }
-
-    fn start_field_search(&mut self, ctx: &egui::Context) {
-        if self.field.target_research_pending && self.field.results.len() == 1 {
-            self.start_field_target_research(ctx);
-            return;
-        }
-        if self.jobs.field_generation.is_running() {
-            return;
-        }
-        let mut configs = match self.field.configs() {
-            Ok(configs) => configs,
-            Err(message) => {
-                self.field.target_research_pending = false;
-                self.field.set_search_range_notice(message.to_string());
-                return;
-            }
-        };
-        let initial_branch_scan_span = match self.field.initial_branch_scan_span_value() {
-            Ok(value) => value,
-            Err(message) => {
-                self.field.target_research_pending = false;
-                self.field.set_search_range_notice(message.to_string());
-                return;
-            }
-        };
-        // 瞬き候補が一意になった後のTarget編集では、その候補のモデル数と
-        // 観測idxを再利用する。NPC範囲を再展開すると別設定の先頭結果で
-        // 選択済みTimelineを置き換えるためである。
-        if self.field.target_research_pending && self.field.results.len() == 1 {
-            if let Some(selected) = self.field.results.get(self.field.selected_result) {
-                let models = selected.models;
-                let observed_model = selected.observed_model;
-                configs.retain(|config| config.models == models);
-                if configs.is_empty() {
-                    if let Some(mut fallback) = self
-                        .field
-                        .configs()
-                        .ok()
-                        .and_then(|mut values| values.pop())
-                    {
-                        fallback.models = models;
-                        fallback.target_model = observed_model;
-                        configs.push(fallback);
-                    }
-                }
-                for config in &mut configs {
-                    config.target_model = observed_model;
-                }
-            }
-        }
-        // 先行Timelineは観測入力に間に合わなかった場合、検索とCPUを奪い合わない
-        // ように止める。完了済みならpoll側でプールへ取り込まれている。
-        self.jobs.field_timeline_generation.cancel_and_discard();
-        self.jobs.field_timeline_extension.cancel_and_discard();
-        self.jobs.field_timeline_extension_key.take();
-        self.jobs.field_timeline_extension_blocked = false;
-        self.jobs.field_timeline_extension_error = None;
-        let target_mode = self.field.target_mode;
-        let cached_pool = self
-            .jobs
-            .field_pool
-            .take()
-            .filter(|pool| configs.iter().all(|config| pool.covers(config)));
-        let (pending_pool, pending_pool_cancel) = self
-            .jobs
-            .field_pool_generation
-            .take()
-            .map_or((None, None), |(handle, cancel)| (Some(handle), cancel));
-        let cancel = pending_pool_cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let repaint = ctx.clone();
-        self.jobs
-            .field_generation
-            .spawn_with_token(cancel.clone(), move || {
-                if cancel.load(Ordering::Acquire) {
-                    return Err(AppError::Cancelled);
-                }
-                let pool = if let Some(pool) = cached_pool {
-                    Ok(pool)
-                } else if let Some(handle) = pending_pool {
-                    let pool = handle.join().map_err(|_| AppError::CacheWorkerJoin)??;
-                    if configs.iter().all(|config| pool.covers(config)) {
-                        Ok(pool)
-                    } else {
-                        crate::application::field::prepare_search_pool_with_configs_cancelable(
-                            &configs,
-                            Some(cancel.as_ref()),
-                        )
-                    }
-                } else {
-                    crate::application::field::prepare_search_pool_with_configs_cancelable(
-                        &configs,
-                        Some(cancel.as_ref()),
-                    )
-                }?;
-                let result =
-                    crate::application::field::search_with_npc_range_with_pool_cancelable_and_span(
-                        &configs,
-                        &pool,
-                        target_mode,
-                        initial_branch_scan_span,
-                        Some(cancel.as_ref()),
-                    )?;
-                repaint.request_repaint();
-                Ok((result, pool))
-            });
-    }
-
-    fn start_field_target_research(&mut self, ctx: &egui::Context) {
-        if self.jobs.field_target_generation.is_running() {
-            return;
-        }
-        let Some(target) = self.field.target_consumption.trim().parse::<i64>().ok() else {
-            self.field.target_research_pending = false;
-            return;
-        };
-        let Some(seed) =
-            u32::from_str_radix(self.field.seed.trim().trim_start_matches("0x"), 16).ok()
-        else {
-            self.field.target_research_pending = false;
-            return;
-        };
-        if let Err(error) = self.field.prepare_shared_timeline_cache() {
-            self.field.target_research_pending = false;
-            self.present_app_error(error);
-            return;
-        }
-        let Some(candidate) = self.field.results.get(self.field.selected_result).cloned() else {
-            self.field.target_research_pending = false;
-            return;
-        };
-        if self.field.observation_cache_for_seed(seed).is_none() {
-            self.field.target_research_pending = false;
-            self.present_app_error(AppError::InvalidState(StateIssue::CacheUnavailable));
-            return;
-        }
-        let key = FieldTargetKey::for_result(seed, target, &candidate);
-        let repaint = ctx.clone();
-        let mut snapshot = self.field.clone();
-        self.jobs
-            .field_target_generation
-            .spawn_cancellable(move |cancel| {
-                let result =
-                    snapshot.retarget_confirmed_result_from_cache(target, Some(cancel.as_ref()));
-                repaint.request_repaint();
-                (key, result)
-            });
     }
 }
 
@@ -2882,360 +1415,7 @@ fn correction_ui(
 }
 
 #[cfg(test)]
-mod rapid_observation_cancel_tests {
-    use super::*;
-
-    const HIGH_START: i64 = 49_500_000;
-    const HIGH_END: i64 = HIGH_START + 100;
-    const TEST_SEED: u32 = 0x5C72_AE19;
-
-    fn app_with_empty_field_timeline() -> UiApp {
-        let config = crate::application::field::FieldConfig {
-            seed: 1,
-            range_start: 0,
-            range_end: 10,
-            models: 1,
-            target_model: 0,
-            observed_intervals: vec![1],
-            tolerance: 1_000,
-            target_consumption: None,
-        };
-        let mut app = UiApp::default();
-        app.field.results = crate::application::field::search(&config)
-            .unwrap()
-            .into_iter()
-            .take(1)
-            .collect();
-        app.field.results[0].timeline.clear();
-        app.field.results[0].next_blink_wait_frame = 0;
-        app.field_timer_retry = true;
-        app
-    }
-
-    #[test]
-    fn hatch_production_recalculation_runs_through_the_background_worker() {
-        let mut app = UiApp::default();
-        app.state.seed = format!("{TEST_SEED:08X}");
-        app.state.range_start = "0".into();
-        app.state.range_end = "1000".into();
-        app.state.target = "5000".into();
-        app.state.npc = "5".into();
-        app.state.candidates = vec![crate::application::state::TimelineCandidate {
-            start_position: 0,
-            sfmt_position: 1000,
-            next_blink_ticks: Some(130),
-            target_reachable: true,
-        }];
-        app.state.observation_cache = crate::domain::rng::generate_observation_cache(
-            TEST_SEED,
-            0..=100_000,
-            100_000,
-            app.state.fps_value(),
-        )
-        .ok();
-        assert!(app.state.observation_cache.is_some());
-
-        app.state.recalculate_production();
-        assert!(app.state.production_preparation_pending);
-        assert!(app.state.production.is_none());
-
-        let context = egui::Context::default();
-        app.maybe_start_production_preparation(&context);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while app.jobs.production_preparation.is_running()
-            && !app.jobs.production_preparation.is_finished()
-            && Instant::now() < deadline
-        {
-            std::thread::yield_now();
-        }
-        assert!(app.jobs.production_preparation.is_finished());
-
-        app.poll_production_preparation();
-
-        assert!(!app.state.production_preparation_pending);
-        assert_eq!(
-            app.state
-                .production
-                .as_ref()
-                .map(|timeline| timeline.target),
-            Some(5000)
-        );
-    }
-
-    #[test]
-    fn production_worker_keeps_pending_state_until_completion() {
-        let mut app = UiApp::default();
-        app.state.seed = format!("{TEST_SEED:08X}");
-        app.state.range_start = "0".into();
-        app.state.range_end = "1000".into();
-        app.state.target = "5000".into();
-        app.state.npc = "5".into();
-        app.state.consider_rotom_talk = false;
-        app.state.candidates = vec![crate::application::state::TimelineCandidate {
-            start_position: 0,
-            sfmt_position: 1000,
-            next_blink_ticks: Some(130),
-            target_reachable: true,
-        }];
-        app.state.observation_cache = crate::domain::rng::generate_observation_cache(
-            TEST_SEED,
-            0..=100_000,
-            100_000,
-            app.state.fps_value(),
-        )
-        .ok();
-        app.state.mark_production_preparation_pending();
-        let (request, _) = app
-            .state
-            .production_preparation_request()
-            .expect("production request");
-        let (release, wait_for_release) = std::sync::mpsc::channel();
-        app.jobs.production_preparation.spawn(move || {
-            wait_for_release.recv().expect("test releases worker");
-            (request, Err(AppError::Cancelled))
-        });
-
-        app.poll_production_preparation();
-        assert!(app.state.production_preparation_pending);
-
-        release.send(()).expect("worker is still waiting");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !app.jobs.production_preparation.is_finished() {
-            assert!(
-                Instant::now() < deadline,
-                "worker should finish after release"
-            );
-            std::thread::yield_now();
-        }
-        app.poll_production_preparation();
-
-        assert!(!app.state.production_preparation_pending);
-    }
-
-    #[test]
-    fn blocked_field_extension_stops_timer_retry_and_reports_the_reason() {
-        let context = egui::Context::default();
-        let mut app = app_with_empty_field_timeline();
-        app.jobs.field_timeline_extension_blocked = true;
-
-        app.retry_field_timer_if_needed(&context);
-
-        assert!(!app.field_timer_retry);
-        assert!(app.field.next_blink_out_of_range);
-        assert!(app.field.notice.is_none());
-
-        let mut app = app_with_empty_field_timeline();
-        app.jobs.field_timeline_extension_blocked = true;
-        app.jobs.field_timeline_extension_error = Some(Arc::new(AppError::InvalidState(
-            StateIssue::CalculationUnavailable,
-        )));
-
-        app.retry_field_timer_if_needed(&context);
-
-        assert!(!app.field_timer_retry);
-        assert!(app.field.notice.is_none());
-    }
-
-    #[test]
-    fn field_extension_worker_error_is_reported_and_blocks_retry() {
-        let mut app = app_with_empty_field_timeline();
-        let result = &app.field.results[0];
-        app.jobs.field_timeline_extension_key =
-            Some((0, result.start_consumption, result.last_wait_frame));
-        app.jobs.field_timeline_extension.spawn(|| {
-            (
-                FieldState::default(),
-                Err(AppError::InvalidState(StateIssue::CalculationUnavailable)),
-            )
-        });
-        while app.jobs.field_timeline_extension.is_running()
-            && !app.jobs.field_timeline_extension.is_finished()
-        {
-            std::thread::yield_now();
-        }
-
-        app.poll_field_timeline_extension();
-
-        assert!(app.jobs.field_timeline_extension_blocked);
-        assert!(matches!(
-            app.jobs.field_timeline_extension_error.as_deref(),
-            Some(AppError::InvalidState(StateIssue::CalculationUnavailable))
-        ));
-        assert!(app.field.notice.is_none());
-    }
-
-    #[test]
-    fn normal_timer_ui_tick_catches_up_after_fifty_million_frame_virtual_elapsed() {
-        let mut app = UiApp::default();
-        app.beep_enabled = false;
-        let context = egui::Context::default();
-        let start = Instant::now();
-        let fps = app.state.fps_value();
-        let first_segment_frames = 120;
-        let total_frames = crate::application::state::MAX_FRAME + first_segment_frames;
-        let virtual_now = start
-            + Duration::from_secs_f64(
-                crate::domain::timing::game_frames_to_seconds(total_frames as f64, fps) + 1.0,
-            );
-        let timer = &mut app.state.normal_timer;
-        timer.timer_start = Some(start);
-        timer.timer_seconds =
-            crate::domain::timing::game_frames_to_seconds(first_segment_frames as f64, fps);
-        timer.timer_segments = vec![
-            (
-                crate::application::timer_state::NormalTimerSegment::Offset(0),
-                first_segment_frames,
-            ),
-            (
-                crate::application::timer_state::NormalTimerSegment::Wait,
-                crate::application::state::MAX_FRAME,
-            ),
-        ];
-        timer.timer_segment_index = 0;
-        timer.finished = false;
-
-        app.tick_normal_timer_at(&context, virtual_now);
-
-        assert!(!app.state.normal_timer.is_running());
-        assert!(app.state.normal_timer.finished);
-        assert_eq!(app.state.normal_timer.remaining_at(virtual_now), 0.0);
-    }
-
-    #[test]
-    fn repeated_gui_updates_do_not_queue_parallel_field_timeline_workers() {
-        let mut app = UiApp::default();
-        let context = egui::Context::default();
-        let (release_sender, release_receiver) = std::sync::mpsc::channel();
-        app.jobs.field_timeline_extension.spawn(move || {
-            let _ = release_receiver.recv();
-            (FieldState::default(), Ok(false))
-        });
-        let worker_id = app.jobs.field_timeline_extension.thread_id().unwrap();
-
-        for _ in 0..100 {
-            app.start_field_timeline_extension(&context);
-            assert_eq!(
-                app.jobs.field_timeline_extension.thread_id().unwrap(),
-                worker_id
-            );
-        }
-
-        release_sender.send(()).unwrap();
-        while !app.jobs.field_timeline_extension.is_finished() {
-            std::thread::yield_now();
-        }
-        let (_, Ok((_, result))) = app.jobs.field_timeline_extension.take_finished().unwrap()
-        else {
-            panic!("field timeline worker should finish successfully");
-        };
-        assert!(!result.unwrap());
-    }
-
-    #[test]
-    fn space_start_cancel_repeated_five_times_does_not_leak_cache_files() {
-        let mut app = UiApp::default();
-        app.state.seed = format!("{TEST_SEED:08X}");
-        app.state.range_start = HIGH_START.to_string();
-        app.state.range_end = HIGH_END.to_string();
-        app.state.target = HIGH_END.to_string();
-        let ctx = egui::Context::default();
-        let cache_path = crate::infrastructure::cache_store::CacheStore::default()
-            .path(TEST_SEED, HIGH_END + 4096);
-
-        let mut started_sessions = 0;
-        let mut blocked_restarts = 0;
-        for attempt in 0..5 {
-            app.start_observation_and_generation(&ctx);
-            assert!(app.state.is_observing(), "session {attempt} should start");
-            started_sessions += 1;
-            std::thread::sleep(Duration::from_millis(10));
-            app.state.cancel_observation();
-            app.cancel_observation_generation();
-            app.clear_unused_sfmt_cache_files();
-
-            if attempt == 0 {
-                // A Space press before the generator acknowledges cancellation cannot start
-                // another session; verify it remains idle instead of duplicating the worker.
-                app.start_observation_and_generation(&ctx);
-                assert!(!app.state.is_observing());
-                blocked_restarts += 1;
-            }
-
-            // Polling while idle discards the canceled result and waits for the cache lease
-            // to be released before the next actual cycle.
-            let wait_started = Instant::now();
-            while app.jobs.generation.is_running() && !app.jobs.generation.is_finished() {
-                assert!(wait_started.elapsed() < Duration::from_secs(30));
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            app.poll_generation();
-
-            for _ in 0..3_000 {
-                if !cache_path.exists() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert!(
-                !cache_path.exists(),
-                "session {attempt} cache should be removed"
-            );
-        }
-        eprintln!(
-            "five 10 ms start/cancel cycles: {started_sessions} started and each cache was removed; {blocked_restarts} immediate restart was blocked until generation completed"
-        );
-    }
-
-    #[test]
-    #[ignore = "generates a roughly 400 MiB cache through Frame 50,000,000 to measure cancel-to-delete latency"]
-    fn measure_high_frame_cancel_to_cache_deletion() {
-        const TARGET: i64 = 50_000_000;
-        const SEED: u32 = 0x7A31_C5E2;
-
-        let mut app = UiApp::default();
-        app.beep_enabled = false;
-        app.state.seed = format!("{SEED:08X}");
-        app.state.range_start = (TARGET - 100).to_string();
-        app.state.range_end = TARGET.to_string();
-        app.state.target = TARGET.to_string();
-        let ctx = egui::Context::default();
-        let cache_path =
-            crate::infrastructure::cache_store::CacheStore::default().path(SEED, TARGET + 4096);
-
-        let started = Instant::now();
-        app.start_observation_and_generation(&ctx);
-        assert!(app.state.is_observing());
-        let generation_started = Instant::now();
-        std::thread::sleep(Duration::from_millis(10));
-        app.state.cancel_observation();
-        app.cancel_observation_generation();
-        let cancelled = Instant::now();
-        app.clear_unused_sfmt_cache_files();
-
-        let worker_wait_started = Instant::now();
-        while app.jobs.generation.is_running() && !app.jobs.generation.is_finished() {
-            assert!(worker_wait_started.elapsed() < Duration::from_secs(60));
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let worker_finished = Instant::now();
-        app.poll_generation();
-
-        let delete_wait_started = Instant::now();
-        while cache_path.exists() {
-            assert!(delete_wait_started.elapsed() < Duration::from_secs(60));
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let deleted = Instant::now();
-
-        eprintln!(
-            "Frame 50,000,000: generation-before-cancel={:?}, cancel-to-worker-finish={:?}, worker-finish-to-delete={:?}, start-to-delete={:?}",
-            cancelled.duration_since(generation_started),
-            worker_finished.duration_since(cancelled),
-            deleted.duration_since(worker_finished),
-            deleted.duration_since(started)
-        );
-    }
-}
+mod tests;
 
 fn input_ui(
     ui: &mut egui::Ui,
@@ -3265,8 +1445,7 @@ fn input_ui(
     let mut observed_talk_changed = false;
     let mut correction_source_changed = false;
     let mut target_committed = false;
-    // 観測開始後は観測したSFMT位置を別モデル条件へ流用しないためSeed/NPCを固定する。
-    // その他の条件は本番タイマー開始まで編集できる。
+    // 観測開始後はSeed/NPCを固定する。条件の変更はリセット後に行う。
     let seed_npc_editable = state.is_idle();
     let condition_editable = state.can_edit_general_settings();
     // Enterで本番区間を終えた後は補正専用欄だけを編集できる。リセットまで一般設定を
