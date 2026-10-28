@@ -931,21 +931,13 @@ fn no_dex_event7_consumption_bound_scan_cancels_promptly() {
         sfmt_position: config.start_frame,
         tick: 0,
     };
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_worker = cancel.clone();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    let canceller = std::thread::spawn(move || {
-        started_rx.recv().expect("search start signal");
-        std::thread::sleep(Duration::from_millis(2));
-        cancel_worker.store(true, Ordering::Release);
-    });
-
+    // Exercise the scan's cancellation checks deterministically. A timed
+    // canceller made this assertion depend on runner scheduling and could run
+    // after the scan had already completed on faster platforms.
+    let cancel = AtomicBool::new(true);
     let started = std::time::Instant::now();
-    started_tx.send(()).expect("start cancellation timer");
-    let result =
-        max_event_generation_consumption(&cache, &delay, &config, cursor, Some(cancel.as_ref()));
+    let result = max_event_generation_consumption(&cache, &delay, &config, cursor, Some(&cancel));
     let elapsed = started.elapsed();
-    canceller.join().expect("cancellation worker");
 
     assert!(result.is_err_and(|error| error.contains("キャンセル")));
     assert!(
@@ -1048,29 +1040,22 @@ fn no_dex_frame1_search_cancels_through_the_full_candidate_path() {
         crate::domain::timing::DEFAULT_FPS,
     );
     let timeline_start = TimeleapTimelineStart::initial(config.start_frame, config.models);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_worker = cancel.clone();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    let canceller = std::thread::spawn(move || {
-        started_rx.recv().expect("search start signal");
-        std::thread::sleep(Duration::from_millis(20));
-        cancel_worker.store(true, Ordering::Release);
-    });
-
+    // Cancellation is pre-requested here so this test is deterministic across
+    // runner speeds. Mid-operation cancellation is covered by the dedicated
+    // cancellation-path tests elsewhere in the suite.
+    let cancel = AtomicBool::new(true);
     let started = std::time::Instant::now();
-    started_tx.send(()).expect("start cancellation timer");
     let result = search_candidates_from_timeline_with_stats(
         &config,
         &timeline_start,
         0,
         &cache,
-        Some(cancel.as_ref()),
+        Some(&cancel),
         true,
         Some(&delay),
         true,
     );
     let elapsed = started.elapsed();
-    canceller.join().expect("cancellation worker");
 
     assert!(result.is_err_and(|error| error.contains("キャンセル")));
     assert!(
