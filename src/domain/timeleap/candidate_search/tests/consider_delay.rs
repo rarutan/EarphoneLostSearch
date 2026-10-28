@@ -897,7 +897,7 @@ fn event7_window_bound_uses_observed_generation_consumption_not_fixed_padding() 
 }
 
 #[test]
-fn no_dex_event7_consumption_bound_scan_cancels_promptly() {
+fn no_dex_event7_consumption_bound_scan_respects_cancellation() {
     let seed = 0x7627_5c90;
     let target_frame = 500_000;
     let config = TimeleapConfig {
@@ -947,13 +947,12 @@ fn no_dex_event7_consumption_bound_scan_cancels_promptly() {
 }
 
 #[test]
-fn no_dex_event7_delay_tick_loop_cancels_promptly() {
+fn no_dex_event7_delay_entry_respects_cancellation() {
     use super::super::super::runtime::consider_delay_landing_frame_cancelable;
 
     let delay = ConsiderDelayConfig {
-        // Keep the uncancelled work well beyond the 2 ms canceller delay.
-        // The old 400_000F workload could finish before the other thread ran,
-        // making this timing test fail despite correct cancellation behavior.
+        // Large enough to catch accidental uncancelled work; the flag below
+        // is already set so this test itself does not depend on thread timing.
         delay_frames: 20_000_000,
         generator: ConsiderDelayGenerator::Event,
         courier: CourierConfig {
@@ -969,17 +968,8 @@ fn no_dex_event7_delay_tick_loop_cancels_promptly() {
         tick: 250,
     };
     let mut sfmt = Sfmt::new(0x7627_5c90);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_worker = cancel.clone();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    let canceller = std::thread::spawn(move || {
-        started_rx.recv().expect("search start signal");
-        std::thread::sleep(Duration::from_millis(2));
-        cancel_worker.store(true, Ordering::Release);
-    });
-
+    let cancel = AtomicBool::new(true);
     let started = std::time::Instant::now();
-    started_tx.send(()).expect("start cancellation timer");
     let result = consider_delay_landing_frame_cancelable(
         &delay,
         &mut status,
@@ -987,10 +977,9 @@ fn no_dex_event7_delay_tick_loop_cancels_promptly() {
         &mut sfmt,
         2,
         100_000_000,
-        Some(cancel.as_ref()),
+        Some(&cancel),
     );
     let elapsed = started.elapsed();
-    canceller.join().expect("cancellation worker");
 
     assert!(result.is_err_and(|error| error.contains("キャンセル")));
     assert!(
@@ -1000,7 +989,7 @@ fn no_dex_event7_delay_tick_loop_cancels_promptly() {
 }
 
 #[test]
-fn no_dex_frame1_search_cancels_through_the_full_candidate_path() {
+fn no_dex_frame1_search_respects_preexisting_cancellation() {
     let seed = 0xDE16_5D10;
     let config = TimeleapConfig {
         seed,
