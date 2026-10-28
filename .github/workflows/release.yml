@@ -80,7 +80,7 @@ jobs:
         run: |
           mkdir -p package
           cp "target/release/$EXECUTABLE_NAME" package/
-          cp README.md package/
+          cp README.md assets/text/THIRD-PARTY-LICENSES.txt package/
           (cd package && zip -r "$GITHUB_WORKSPACE/$ASSET_NAME" .)
 
       - name: Package Windows release
@@ -92,7 +92,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path package -Force | Out-Null
           Copy-Item "target/release/$env:EXECUTABLE_NAME" package/
-          Copy-Item README.md package/
+          Copy-Item README.md, assets/text/THIRD-PARTY-LICENSES.txt package/
           Compress-Archive -Path package/* -DestinationPath "$env:GITHUB_WORKSPACE/$env:ASSET_NAME"
 
       - name: Upload package
@@ -127,4 +127,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "EarphoneLostSearch $RELEASE_TAG" \
-            --notes "Release for Windows, Linux, and macOS x64. Each ZIP includes the application and README."
+            --notes "Release for Windows, Linux, and macOS x64. Each ZIP includes the application, README, and third-party licenses."
