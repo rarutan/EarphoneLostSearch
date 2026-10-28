@@ -80,7 +80,7 @@ jobs:
         run: |
           mkdir -p package
           cp "target/release/$EXECUTABLE_NAME" package/
-          cp README.md LICENSE assets/text/THIRD_PARTY_NOTICES.md assets/text/3DSRNGTool-LICENSE.txt package/
+          cp README.md package/
           (cd package && zip -r "$GITHUB_WORKSPACE/$ASSET_NAME" .)
 
       - name: Package Windows release
@@ -92,7 +92,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path package -Force | Out-Null
           Copy-Item "target/release/$env:EXECUTABLE_NAME" package/
-          Copy-Item README.md, LICENSE, assets/text/THIRD_PARTY_NOTICES.md, assets/text/3DSRNGTool-LICENSE.txt package/
+          Copy-Item README.md package/
           Compress-Archive -Path package/* -DestinationPath "$env:GITHUB_WORKSPACE/$env:ASSET_NAME"
 
       - name: Upload package
@@ -105,7 +105,7 @@ jobs:
 
   publish:
     if: github.ref == 'refs/heads/main'
-    name: Publish prerelease
+    name: Publish release
     timeout-minutes: 5
     needs: build
     runs-on: ubuntu-latest
@@ -118,7 +118,7 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Create GitHub prerelease
+      - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
@@ -127,5 +127,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "EarphoneLostSearch $RELEASE_TAG" \
-            --notes "Prerelease for Windows, Linux, and macOS x64. Each ZIP includes the application, README, MIT license, and third-party license notices." \
-            --prerelease
+            --notes "Release for Windows, Linux, and macOS x64. Each ZIP includes the application and README."
